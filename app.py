@@ -8,32 +8,12 @@ CORS(app)
 
 BINANCE_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 COINGLASS_URL = "https://open-api.coinglass.com/public/v2"
-
 CG_KEY = os.environ.get("COINGLASS_API_KEY", "")
-
 COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT","LTCUSDT"]
 
 @app.route("/")
 def home():
     return jsonify({"status": "CryptoEdge AI Backend Running"})
-
-@app.route("/api/binance")
-def binance():
-    symbol = request.args.get("symbol", "BTCUSDT").upper()
-    try:
-        r = requests.get(f"{BINANCE_URL}?symbol={symbol}", timeout=8)
-        d = r.json()
-        return jsonify({
-            "symbol": symbol,
-            "price": d.get("lastPrice"),
-            "change": d.get("priceChangePercent"),
-            "volume": d.get("quoteVolume"),
-            "high": d.get("highPrice"),
-            "low": d.get("lowPrice"),
-            "status": "ok"
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)}), 500
 
 @app.route("/api/scan")
 def scan():
@@ -44,14 +24,14 @@ def scan():
             d = r.json()
             results.append({
                 "symbol": sym,
-                "price": d.get("lastPrice"),
-                "change": d.get("priceChangePercent"),
-                "volume": d.get("quoteVolume"),
-                "high": d.get("highPrice"),
-                "low": d.get("lowPrice"),
+                "price": str(d.get("lastPrice", "0")),
+                "change": str(d.get("priceChangePercent", "0")),
+                "volume": str(d.get("quoteVolume", "0")),
+                "high": str(d.get("highPrice", "0")),
+                "low": str(d.get("lowPrice", "0")),
             })
         except:
-            pass
+            results.append({"symbol": sym,"price":"0","change":"0","volume":"0","high":"0","low":"0"})
     results.sort(key=lambda x: abs(float(x["change"] or 0)), reverse=True)
     return jsonify({"coins": results, "status": "ok"})
 
@@ -62,11 +42,7 @@ def cg_funding():
     if not cg_key:
         return jsonify({"status": "error", "msg": "No CoinGlass API key"}), 401
     try:
-        r = requests.get(
-            f"{COINGLASS_URL}/indicator/funding_rate?symbol={symbol}&exchange=Binance",
-            headers={"CG-API-KEY": cg_key},
-            timeout=8
-        )
+        r = requests.get(f"{COINGLASS_URL}/indicator/funding_rate?symbol={symbol}&exchange=Binance", headers={"CG-API-KEY": cg_key}, timeout=8)
         return jsonify(r.json())
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)}), 500
@@ -78,27 +54,7 @@ def cg_oi():
     if not cg_key:
         return jsonify({"status": "error", "msg": "No CoinGlass API key"}), 401
     try:
-        r = requests.get(
-            f"{COINGLASS_URL}/indicator/open_interest?symbol={symbol}&exchange=Binance",
-            headers={"CG-API-KEY": cg_key},
-            timeout=8
-        )
-        return jsonify(r.json())
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)}), 500
-
-@app.route("/api/coinglass/liquidations")
-def cg_liq():
-    symbol = request.args.get("symbol", "BTC")
-    cg_key = request.headers.get("CG-API-KEY") or CG_KEY
-    if not cg_key:
-        return jsonify({"status": "error", "msg": "No CoinGlass API key"}), 401
-    try:
-        r = requests.get(
-            f"{COINGLASS_URL}/indicator/liquidation_chart?symbol={symbol}&exchange=Binance&interval=h1",
-            headers={"CG-API-KEY": cg_key},
-            timeout=8
-        )
+        r = requests.get(f"{COINGLASS_URL}/indicator/open_interest?symbol={symbol}&exchange=Binance", headers={"CG-API-KEY": cg_key}, timeout=8)
         return jsonify(r.json())
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)}), 500
