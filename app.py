@@ -11,7 +11,7 @@ COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT"
 
 @app.route("/")
 def home():
-    return jsonify({"status": "CryptoEdge AI Backend Running"})
+    return jsonify({"status": "CryptoEdge AI Backend Running v2"})
 
 @app.route("/api/market-data")
 def market_data():
@@ -40,11 +40,11 @@ def scan():
             d = r.json()
             out.append({
                 "symbol": sym,
-                "price": d.get("lastPrice","0"),
-                "change": d.get("priceChangePercent","0"),
-                "volume": d.get("quoteVolume","0"),
-                "high": d.get("highPrice","0"),
-                "low": d.get("lowPrice","0"),
+                "price": d.get("lastPrice", "0"),
+                "change": d.get("priceChangePercent", "0"),
+                "volume": d.get("quoteVolume", "0"),
+                "high": d.get("highPrice", "0"),
+                "low": d.get("lowPrice", "0"),
                 "oi": "0",
                 "oi_change": "0",
                 "long_liq": "0",
@@ -53,8 +53,8 @@ def scan():
                 "long_vol": "0",
                 "short_vol": "0",
             })
-        except:
-            pass
+        except Exception as e:
+            print(f"Error {sym}: {e}")
     out.sort(key=lambda x: abs(float(x["change"])), reverse=True)
     return jsonify({"coins": out, "status": "ok"})
 
@@ -64,3 +64,5 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+# v2
