@@ -6,7 +6,7 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
 COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT","LTCUSDT"]
 
 @app.route("/")
