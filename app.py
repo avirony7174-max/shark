@@ -114,7 +114,9 @@ def fetch_oi_data():
 
 
 def fetch_funding_data():
-    """Funding Rate — confirmed Hobbyist"""
+    """Funding Rate — confirmed Hobbyist
+    Response: data = [{symbol, stablecoin_margin_list: [{exchange, funding_rate}], token_margin_list}]
+    """
     try:
         result = {}
         for coin in COINS:
@@ -127,18 +129,23 @@ def fetch_funding_data():
             data = r.json()
             if data.get("code") == "0":
                 items = data.get("data", [])
-                # Try stablecoin_margin_list first (Binance)
-                binance = None
                 for item in items:
-                    if isinstance(item, dict):
-                        for sub in item.get("stablecoin_margin_list", []):
-                            if sub.get("exchange") == "Binance":
-                                binance = sub
-                                break
-                if binance:
-                    result[coin] = str(binance.get("funding_rate", 0))
-                elif items and isinstance(items[0], dict):
-                    result[coin] = str(items[0].get("funding_rate", 0))
+                    if not isinstance(item, dict):
+                        continue
+                    # Match symbol
+                    if item.get("symbol", "").upper() != coin.upper():
+                        continue
+                    # Get Binance from stablecoin_margin_list
+                    stablelist = item.get("stablecoin_margin_list", [])
+                    binance = next(
+                        (x for x in stablelist if x.get("exchange") == "Binance"),
+                        None
+                    )
+                    if binance:
+                        result[coin] = str(binance.get("funding_rate", 0))
+                    elif stablelist:
+                        result[coin] = str(stablelist[0].get("funding_rate", 0))
+                    break
         return result
     except Exception as e:
         print(f"Funding error: {e}")
