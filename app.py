@@ -6,13 +6,21 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# Config
-BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr"
 CG_BASE = "https://open-api-v4.coinglass.com/api"
 CG_KEY = os.environ.get("COINGLASS_API_KEY", "")
 
 COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LTC"]
-COINS_USDT = [c + "USDT" for c in COINS]
+
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "BNB": "binancecoin",
+    "XRP": "ripple",
+    "DOGE": "dogecoin",
+    "AVAX": "avalanche-2",
+    "LTC": "litecoin"
+}
 
 
 def cg_headers():
@@ -22,8 +30,39 @@ def cg_headers():
     }
 
 
+def fetch_prices():
+    """CoinGecko free API — price, change, volume"""
+    try:
+        ids = ",".join(COINGECKO_IDS.values())
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={
+                "ids": ids,
+                "vs_currencies": "usd",
+                "include_24hr_change": "true",
+                "include_24hr_vol": "true",
+                "include_24h_high": "true",
+                "include_24h_low": "true",
+            },
+            timeout=10
+        )
+        data = r.json()
+        result = {}
+        for sym, gecko_id in COINGECKO_IDS.items():
+            d = data.get(gecko_id, {})
+            result[sym] = {
+                "price": str(d.get("usd", 0)),
+                "change": str(round(d.get("usd_24h_change", 0), 2)),
+                "volume": str(d.get("usd_24h_vol", 0)),
+            }
+        return result
+    except Exception as e:
+        print(f"CoinGecko error: {e}")
+    return {}
+
+
 def fetch_liquidation_data():
-    """Fetch liquidation data for all coins — confirmed Hobbyist endpoint"""
+    """Liquidation data — confirmed Hobbyist"""
     try:
         r = requests.get(
             f"{CG_BASE}/futures/liquidation/coin-list",
@@ -41,44 +80,12 @@ def fetch_liquidation_data():
                 }
             return result
     except Exception as e:
-        print(f"Liquidation fetch error: {e}")
-    return {}
-
-
-def fetch_funding_data():
-    """Fetch funding rate data — confirmed Hobbyist endpoint"""
-    try:
-        result = {}
-        for coin in COINS:
-            r = requests.get(
-                f"{CG_BASE}/futures/funding-rate/exchange-list",
-                headers=cg_headers(),
-                params={"symbol": coin},
-                timeout=10
-            )
-            data = r.json()
-            if data.get("code") == "0":
-                items = data.get("data", [])
-                # Get Binance funding rate
-                binance = next(
-                    (x for x in items
-                     if isinstance(x, dict) and x.get("exchange") == "Binance"),
-                    None
-                )
-                if binance:
-                    result[coin] = str(binance.get("funding_rate", 0))
-                elif items:
-                    # fallback: first item
-                    first = items[0] if isinstance(items[0], dict) else {}
-                    result[coin] = str(first.get("funding_rate", 0))
-        return result
-    except Exception as e:
-        print(f"Funding fetch error: {e}")
+        print(f"Liquidation error: {e}")
     return {}
 
 
 def fetch_oi_data():
-    """Fetch open interest data — confirmed Hobbyist endpoint"""
+    """Open Interest — confirmed Hobbyist"""
     try:
         result = {}
         for coin in COINS:
@@ -91,10 +98,8 @@ def fetch_oi_data():
             data = r.json()
             if data.get("code") == "0":
                 items = data.get("data", [])
-                # Get "All" exchange for total OI
                 all_ex = next(
-                    (x for x in items
-                     if isinstance(x, dict) and x.get("exchange") == "All"),
+                    (x for x in items if isinstance(x, dict) and x.get("exchange") == "All"),
                     None
                 )
                 if all_ex:
@@ -104,7 +109,39 @@ def fetch_oi_data():
                     }
         return result
     except Exception as e:
-        print(f"OI fetch error: {e}")
+        print(f"OI error: {e}")
+    return {}
+
+
+def fetch_funding_data():
+    """Funding Rate — confirmed Hobbyist"""
+    try:
+        result = {}
+        for coin in COINS:
+            r = requests.get(
+                f"{CG_BASE}/futures/funding-rate/exchange-list",
+                headers=cg_headers(),
+                params={"symbol": coin},
+                timeout=10
+            )
+            data = r.json()
+            if data.get("code") == "0":
+                items = data.get("data", [])
+                # Try stablecoin_margin_list first (Binance)
+                binance = None
+                for item in items:
+                    if isinstance(item, dict):
+                        for sub in item.get("stablecoin_margin_list", []):
+                            if sub.get("exchange") == "Binance":
+                                binance = sub
+                                break
+                if binance:
+                    result[coin] = str(binance.get("funding_rate", 0))
+                elif items and isinstance(items[0], dict):
+                    result[coin] = str(items[0].get("funding_rate", 0))
+        return result
+    except Exception as e:
+        print(f"Funding error: {e}")
     return {}
 
 
@@ -118,59 +155,30 @@ def health():
     return jsonify({"status": "healthy"})
 
 
-@app.route("/api/market-data")
-def market_data():
-    symbol = request.args.get("symbol", "BTCUSDT").upper()
-    try:
-        r = requests.get(f"{BINANCE_URL}?symbol={symbol}", timeout=10)
-        d = r.json()
-        return jsonify({
-            "symbol": symbol,
-            "price": d.get("lastPrice"),
-            "change": d.get("priceChangePercent"),
-            "volume": d.get("quoteVolume"),
-            "high": d.get("highPrice"),
-            "low": d.get("lowPrice"),
-            "status": "connected"
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)})
-
-
 @app.route("/api/scan")
 def scan():
-    # Fetch all CoinGlass data in parallel batches
+    prices = fetch_prices()
     liq_data = fetch_liquidation_data()
     oi_data = fetch_oi_data()
     funding_data = fetch_funding_data()
 
     out = []
-    for sym_usdt in COINS_USDT:
-        sym = sym_usdt.replace("USDT", "")
-        try:
-            # Binance price data
-            r = requests.get(f"{BINANCE_URL}?symbol={sym_usdt}", timeout=8)
-            d = r.json()
+    for sym in COINS:
+        price_info = prices.get(sym, {})
+        liq = liq_data.get(sym, {})
+        oi = oi_data.get(sym, {})
 
-            # CoinGlass data
-            liq = liq_data.get(sym, {})
-            oi = oi_data.get(sym, {})
-
-            out.append({
-                "symbol": sym_usdt,
-                "price": d.get("lastPrice", "0"),
-                "change": d.get("priceChangePercent", "0"),
-                "volume": d.get("quoteVolume", "0"),
-                "high": d.get("highPrice", "0"),
-                "low": d.get("lowPrice", "0"),
-                "oi": oi.get("oi", "0"),
-                "oi_change": oi.get("oi_change", "0"),
-                "long_liq": liq.get("long_liq", "0"),
-                "short_liq": liq.get("short_liq", "0"),
-                "funding": funding_data.get(sym, "0"),
-            })
-        except Exception as e:
-            print(f"Error {sym_usdt}: {e}")
+        out.append({
+            "symbol": sym + "USDT",
+            "price": price_info.get("price", "0"),
+            "change": price_info.get("change", "0"),
+            "volume": price_info.get("volume", "0"),
+            "oi": oi.get("oi", "0"),
+            "oi_change": oi.get("oi_change", "0"),
+            "long_liq": liq.get("long_liq", "0"),
+            "short_liq": liq.get("short_liq", "0"),
+            "funding": funding_data.get(sym, "0"),
+        })
 
     out.sort(key=lambda x: abs(float(x["change"])), reverse=True)
     return jsonify({"coins": out, "status": "ok"})
