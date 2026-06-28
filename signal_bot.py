@@ -300,7 +300,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = VALID_COINS[text]
         await update.message.reply_text("⏳ Fetching data...")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(None, get_full_analysis, symbol)
             await update.message.reply_text(msg, parse_mode="HTML")
         except Exception as e:
@@ -375,6 +375,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot polling started")
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=True)
 
 
