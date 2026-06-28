@@ -1,26 +1,19 @@
 import os
 import time
 import requests
+import threading
 from datetime import datetime, timezone
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-CG_KEY             = os.environ.get("COINGLASS_API_KEY", "")
-CG_BASE            = "https://open-api-v4.coinglass.com/api"
 
 COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT"]
-CG_SYMBOLS = {
-    "BTCUSDT":  "BTC",
-    "ETHUSDT":  "ETH",
-    "SOLUSDT":  "SOL",
-    "LINKUSDT": "LINK",
-}
 VALID_COINS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "SOL": "SOLUSDT",
+    "BTC":  "BTCUSDT",
+    "ETH":  "ETHUSDT",
+    "SOL":  "SOLUSDT",
     "LINK": "LINKUSDT",
 }
 
@@ -40,10 +33,6 @@ def send_telegram(message):
         }, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
-
-
-def cg_headers():
-    return {"CG-API-KEY": CG_KEY, "accept": "application/json"}
 
 
 def fetch_daily_candles(symbol, limit=60):
@@ -79,13 +68,48 @@ def fetch_price_ticker(symbol):
         return {
             "price":  float(d.get("lastPrice", 0)),
             "change": float(d.get("priceChangePercent", 0)),
-            "volume": float(d.get("quoteVolume", 0)),
-            "high":   float(d.get("highPrice", 0)),
-            "low":    float(d.get("lowPrice", 0)),
         }
     except Exception as e:
         print(f"Ticker error {symbol}: {e}")
         return {}
+
+
+def fetch_oi(symbol):
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/openInterest",
+            params={"symbol": symbol},
+            timeout=10
+        )
+        data = r.json()
+        oi = float(data.get("openInterest", 0))
+        price_r = requests.get(
+            "https://fapi.binance.com/fapi/v1/ticker/price",
+            params={"symbol": symbol},
+            timeout=10
+        )
+        price = float(price_r.json().get("price", 0))
+        oi_usd = round(oi * price / 1e9, 2)
+        return oi_usd
+    except Exception as e:
+        print(f"OI error {symbol}: {e}")
+    return None
+
+
+def fetch_funding(symbol):
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/fundingRate",
+            params={"symbol": symbol, "limit": 1},
+            timeout=10
+        )
+        data = r.json()
+        if data and isinstance(data, list):
+            rate = float(data[0].get("fundingRate", 0)) * 100
+            return round(rate, 4)
+    except Exception as e:
+        print(f"Funding error {symbol}: {e}")
+    return None
 
 
 def fetch_taker_volume(symbol):
@@ -97,16 +121,13 @@ def fetch_taker_volume(symbol):
         )
         data = r.json()
         if data and isinstance(data, list):
-            item = data[0]
-            buy  = float(item.get("buyVol", 0))
-            sell = float(item.get("sellVol", 0))
+            buy  = float(data[0].get("buyVol", 0))
+            sell = float(data[0].get("sellVol", 0))
             total = buy + sell
             if total > 0:
-                buy_pct  = round(buy / total * 100, 1)
-                sell_pct = round(sell / total * 100, 1)
-                return buy_pct, sell_pct
+                return round(buy/total*100, 1), round(sell/total*100, 1)
     except Exception as e:
-        print(f"Taker volume error {symbol}: {e}")
+        print(f"Taker error {symbol}: {e}")
     return None, None
 
 
@@ -124,11 +145,11 @@ def fetch_ls_ratio(symbol):
             short = float(data[0].get("shortAccount", 0)) * 100
             return round(ratio, 2), round(long, 1), round(short, 1)
     except Exception as e:
-        print(f"L/S ratio error {symbol}: {e}")
+        print(f"L/S error {symbol}: {e}")
     return None, None, None
 
 
-def fetch_top_trader_ratio(symbol):
+def fetch_top_trader(symbol):
     try:
         r = requests.get(
             "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
@@ -143,59 +164,6 @@ def fetch_top_trader_ratio(symbol):
     except Exception as e:
         print(f"Top trader error {symbol}: {e}")
     return None, None
-
-
-def fetch_oi(cg_sym):
-    try:
-        r = requests.get(
-            f"{CG_BASE}/futures/open-interest/exchange-list",
-            headers=cg_headers(),
-            params={"symbol": cg_sym},
-            timeout=10
-        )
-        data = r.json()
-        if data.get("code") == "0":
-            items = data.get("data", [])
-            all_ex = next(
-                (x for x in items if isinstance(x, dict) and x.get("exchange") == "All"),
-                None
-            )
-            if all_ex:
-                oi     = all_ex.get("open_interest_usd", 0)
-                change = all_ex.get("open_interest_usd_change_percent", 0)
-                return round(oi / 1e9, 2), round(change, 2)
-    except Exception as e:
-        print(f"OI error {cg_sym}: {e}")
-    return None, None
-
-
-def fetch_funding(cg_sym):
-    try:
-        r = requests.get(
-            f"{CG_BASE}/futures/funding-rate/exchange-list",
-            headers=cg_headers(),
-            params={"symbol": cg_sym},
-            timeout=10
-        )
-        data = r.json()
-        if data.get("code") == "0":
-            for item in data.get("data", []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get("symbol", "").upper() != cg_sym.upper():
-                    continue
-                stablelist = item.get("stablecoin_margin_list", [])
-                binance = next(
-                    (x for x in stablelist if x.get("exchange") == "Binance"),
-                    None
-                )
-                if binance:
-                    return round(float(binance.get("funding_rate", 0)) * 100, 4)
-                elif stablelist:
-                    return round(float(stablelist[0].get("funding_rate", 0)) * 100, 4)
-    except Exception as e:
-        print(f"Funding error {cg_sym}: {e}")
-    return None
 
 
 def calc_ema_series(closes, period):
@@ -251,22 +219,23 @@ def check_signal(candles):
     if long_cond:
         sl = c_close - atr * 1.5
         tp = c_close + (c_close - sl) * 3.0
-        return {"type": "LONG", "entry": round(c_close, 2),
-                "sl": round(sl, 2), "tp": round(tp, 2)}
+        return {
+            "entry": round(c_close, 2),
+            "sl":    round(sl, 2),
+            "tp":    round(tp, 2),
+        }
     return None
 
 
 def get_full_analysis(symbol):
     coin    = symbol.replace("USDT", "")
-    cg_sym  = CG_SYMBOLS.get(symbol, coin)
-
     ticker  = fetch_price_ticker(symbol)
     candles = fetch_daily_candles(symbol, limit=60)
+    oi                          = fetch_oi(symbol)
+    funding                     = fetch_funding(symbol)
     buy_pct, sell_pct           = fetch_taker_volume(symbol)
     ls_ratio, ls_long, ls_short = fetch_ls_ratio(symbol)
-    tt_long, tt_short           = fetch_top_trader_ratio(symbol)
-    oi, oi_change               = fetch_oi(cg_sym)
-    funding                     = fetch_funding(cg_sym)
+    tt_long, tt_short           = fetch_top_trader(symbol)
     sig                         = check_signal(candles) if candles else None
 
     price  = ticker.get("price", 0)
@@ -279,8 +248,10 @@ def get_full_analysis(symbol):
     es = round(calc_ema_series(closes, EMA_SLOW)[-1], 2) if len(closes) >= EMA_SLOW else "—"
     bias = "Bullish ✅" if (isinstance(ef, float) and isinstance(es, float) and ef > es) else "Bearish ❌"
 
-    oi_line      = f"<code>{oi}B</code>  {'▲' if oi_change and oi_change > 0 else '▼'} {oi_change}%" if oi else "—"
-    funding_line = f"<code>{'+' if funding and funding >= 0 else ''}{funding}%</code>  ({'Longs pay' if funding and funding >= 0 else 'Shorts pay'})" if funding else "—"
+    oi_line      = f"<code>{oi}B</code>" if oi else "—"
+    f_sign       = "+" if funding and funding >= 0 else ""
+    f_pay        = "Longs pay" if funding and funding >= 0 else "Shorts pay"
+    funding_line = f"<code>{f_sign}{funding}%</code>  ({f_pay})" if funding is not None else "—"
     taker_line   = f"Buy <code>{buy_pct}%</code>  Sell <code>{sell_pct}%</code>" if buy_pct else "—"
     ls_line      = f"<code>{ls_ratio}</code>  (Long <code>{ls_long}%</code> · Short <code>{ls_short}%</code>)" if ls_ratio else "—"
     tt_line      = f"Long <code>{tt_long}%</code>  Short <code>{tt_short}%</code>" if tt_long else "—"
@@ -290,116 +261,4 @@ def get_full_analysis(symbol):
             f"🎯 <b>LONG Setup Active</b>\n"
             f"Entry: <code>{sig['entry']}</code>\n"
             f"SL:      <code>{sig['sl']}</code>\n"
-            f"TP:      <code>{sig['tp']}</code>"
-        )
-    else:
-        signal_line = "⏳ No signal — waiting for setup"
-
-    return (
-        f"📊 <b>{coin}/USDT Analysis</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"Price:   <code>${price:,.2f}</code>  {ch_icon} {ch_sign}{change}%\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📈 <b>Trend</b>\n"
-        f"EMA 21:  <code>{ef}</code>\n"
-        f"EMA 50:  <code>{es}</code>\n"
-        f"Bias:      {bias}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Futures Data</b>\n"
-        f"OI:          {oi_line}\n"
-        f"Funding:  {funding_line}\n"
-        f"L/S:          {ls_line}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🐋 <b>Whale Activity</b>\n"
-        f"Taker:       {taker_line}\n"
-        f"Top Trader: {tt_line}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"{signal_line}"
-    )
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().upper()
-    if text in VALID_COINS:
-        symbol = VALID_COINS[text]
-        await update.message.reply_text("⏳ Fetching data...")
-        msg = get_full_analysis(symbol)
-        await update.message.reply_text(msg, parse_mode="HTML")
-    else:
-        await update.message.reply_text(
-            "Send a coin name:\n<b>BTC · ETH · SOL · LINK</b>",
-            parse_mode="HTML"
-        )
-
-
-def auto_signal_loop():
-    import threading
-
-    armed         = {coin: True  for coin in COINS}
-    last_sig_type = {coin: None  for coin in COINS}
-
-    def loop():
-        while True:
-            now = datetime.now(timezone.utc)
-            print(f"[{now.strftime('%H:%M UTC')}] Auto signal check...")
-            for symbol in COINS:
-                try:
-                    candles = fetch_daily_candles(symbol, limit=60)
-                    if not candles:
-                        continue
-                    sig = check_signal(candles)
-                    if sig:
-                        if armed[symbol] and last_sig_type[symbol] != sig["type"]:
-                            cg_sym = CG_SYMBOLS[symbol]
-                            oi, oi_change = fetch_oi(cg_sym)
-                            funding       = fetch_funding(cg_sym)
-                            coin          = symbol.replace("USDT", "")
-                            f_sign        = "+" if funding and funding >= 0 else ""
-                            f_pay         = "Longs pay" if funding and funding >= 0 else "Shorts pay"
-                            oi_arrow      = "▲" if oi_change and oi_change > 0 else "▼"
-                            msg = (
-                                f"🟢 <b>LONG SIGNAL</b>\n"
-                                f"<b>{coin}/USDT</b> · Daily\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"Entry:  <code>{sig['entry']}</code>\n"
-                                f"SL:       <code>{sig['sl']}</code>\n"
-                                f"TP:       <code>{sig['tp']}</code>\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"OI:        <code>{oi}B</code>  {oi_arrow} {oi_change}%\n"
-                                f"Funding: <code>{f_sign}{funding}%</code>  ({f_pay})\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"<i>EMA Swing 21/50 · RR 1:3</i>"
-                            )
-                            send_telegram(msg)
-                            print(f"Signal sent: {symbol} LONG")
-                            armed[symbol]         = False
-                            last_sig_type[symbol] = "LONG"
-                    else:
-                        armed[symbol] = True
-                except Exception as e:
-                    print(f"Error {symbol}: {e}")
-            time.sleep(CHECK_INTERVAL)
-
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-
-
-def main():
-    print("Signal Bot starting...")
-    send_telegram(
-        "✅ <b>Signal Bot চালু হয়েছে</b>\n"
-        "BTC · ETH · SOL · LINK monitoring\n\n"
-        "যেকোনো সময় লিখো:\n"
-        "<b>BTC</b> বা <b>ETH</b> বা <b>SOL</b> বা <b>LINK</b>"
-    )
-
-    auto_signal_loop()
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot polling started")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+            f"TP:
