@@ -39,33 +39,33 @@ def send_telegram(message):
 def fetch_daily_candles(symbol, limit=60):
     try:
         r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": "1d", "limit": limit},
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "spot", "symbol": symbol, "interval": "D", "limit": limit},
             timeout=10
         )
         data = r.json()
-        if not isinstance(data, list):
-            print(f"Binance klines error {symbol}: {data}")
+        if data.get("retCode") != 0:
+            print(f"Bybit klines error {symbol}: {data}")
             return []
         candles = []
-        for c in data:
+        for row in reversed(data["result"]["list"]):
             candles.append({
-                "open":   float(c[1]),
-                "high":   float(c[2]),
-                "low":    float(c[3]),
-                "close":  float(c[4]),
-                "volume": float(c[5]),
+                "open":   float(row[1]),
+                "high":   float(row[2]),
+                "low":    float(row[3]),
+                "close":  float(row[4]),
+                "volume": float(row[5]),
             })
         return candles
     except Exception as e:
-        print(f"Binance candle error {symbol}: {e}")
+        print(f"Bybit candle error {symbol}: {e}")
         return []
 
 
 def fetch_price_ticker(symbol):
     try:
         r = requests.get(
-            "https://api.binance.com/api/v3/ticker/24hr",
+            "https://api3.binance.com/api/v3/ticker/24hr",
             params={"symbol": symbol},
             timeout=10
         )
