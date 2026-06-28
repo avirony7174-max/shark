@@ -65,14 +65,18 @@ def fetch_daily_candles(symbol, limit=60):
 def fetch_price_ticker(symbol):
     try:
         r = requests.get(
-            "https://api3.binance.com/api/v3/ticker/24hr",
-            params={"symbol": symbol},
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "spot", "symbol": symbol},
             timeout=10
         )
         d = r.json()
+        if d.get("retCode") != 0 or not d["result"]["list"]:
+            print(f"Bybit ticker error {symbol}: {d}")
+            return {}
+        t = d["result"]["list"][0]
         return {
-            "price":  float(d.get("lastPrice", 0)),
-            "change": float(d.get("priceChangePercent", 0)),
+            "price":  float(t.get("lastPrice", 0)),
+            "change": round(float(t.get("price24hPcnt", 0)) * 100, 2),
         }
     except Exception as e:
         print(f"Ticker error {symbol}: {e}")
