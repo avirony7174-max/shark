@@ -42,8 +42,12 @@ def fetch_daily_candles(symbol, limit=60):
             params={"symbol": symbol, "interval": "1d", "limit": limit},
             timeout=10
         )
+        data = r.json()
+        if not isinstance(data, list):
+            print(f"Binance klines error {symbol}: {data}")
+            return []
         candles = []
-        for c in r.json():
+        for c in data:
             candles.append({
                 "open":   float(c[1]),
                 "high":   float(c[2]),
