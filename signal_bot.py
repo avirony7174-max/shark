@@ -83,23 +83,24 @@ def fetch_price_ticker(symbol):
         return {}
 
 
+def _bybit_linear_ticker(symbol):
+    r = requests.get(
+        "https://api.bybit.com/v5/market/tickers",
+        params={"category": "linear", "symbol": symbol},
+        timeout=10
+    )
+    d = r.json()
+    if d.get("retCode") != 0 or not d["result"]["list"]:
+        return None
+    return d["result"]["list"][0]
+
+
 def fetch_oi(symbol):
     try:
-        r = requests.get(
-            "https://fapi.binance.com/fapi/v1/openInterest",
-            params={"symbol": symbol},
-            timeout=10
-        )
-        data = r.json()
-        oi = float(data.get("openInterest", 0))
-        price_r = requests.get(
-            "https://fapi.binance.com/fapi/v1/ticker/price",
-            params={"symbol": symbol},
-            timeout=10
-        )
-        price = float(price_r.json().get("price", 0))
-        oi_usd = round(oi * price / 1e9, 2)
-        return oi_usd
+        t = _bybit_linear_ticker(symbol)
+        if t is None:
+            return None
+        return round(float(t.get("openInterestValue", 0)) / 1e9, 2)
     except Exception as e:
         print(f"OI error {symbol}: {e}")
     return None
@@ -107,72 +108,42 @@ def fetch_oi(symbol):
 
 def fetch_funding(symbol):
     try:
-        r = requests.get(
-            "https://fapi.binance.com/fapi/v1/fundingRate",
-            params={"symbol": symbol, "limit": 1},
-            timeout=10
-        )
-        data = r.json()
-        if data and isinstance(data, list):
-            rate = float(data[0].get("fundingRate", 0)) * 100
-            return round(rate, 4)
+        t = _bybit_linear_ticker(symbol)
+        if t is None:
+            return None
+        return round(float(t.get("fundingRate", 0)) * 100, 4)
     except Exception as e:
         print(f"Funding error {symbol}: {e}")
     return None
 
 
 def fetch_taker_volume(symbol):
-    try:
-        r = requests.get(
-            "https://fapi.binance.com/futures/data/takerlongshortRatio",
-            params={"symbol": symbol, "period": "1h", "limit": 1},
-            timeout=10
-        )
-        data = r.json()
-        if data and isinstance(data, list):
-            buy  = float(data[0].get("buyVol", 0))
-            sell = float(data[0].get("sellVol", 0))
-            total = buy + sell
-            if total > 0:
-                return round(buy/total*100, 1), round(sell/total*100, 1)
-    except Exception as e:
-        print(f"Taker error {symbol}: {e}")
     return None, None
 
 
 def fetch_ls_ratio(symbol):
     try:
         r = requests.get(
-            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-            params={"symbol": symbol, "period": "1h", "limit": 1},
+            "https://api.bybit.com/v5/market/account-ratio",
+            params={"category": "linear", "symbol": symbol, "period": "1h", "limit": 1},
             timeout=10
         )
-        data = r.json()
-        if data and isinstance(data, list):
-            ratio = float(data[0].get("longShortRatio", 0))
-            long  = float(data[0].get("longAccount", 0)) * 100
-            short = float(data[0].get("shortAccount", 0)) * 100
-            return round(ratio, 2), round(long, 1), round(short, 1)
+        d = r.json()
+        if d.get("retCode") != 0 or not d["result"]["list"]:
+            return None, None, None
+        item = d["result"]["list"][0]
+        buy   = float(item.get("buyRatio", 0))
+        sell  = float(item.get("sellRatio", 0))
+        ratio = round(buy / sell, 2) if sell > 0 else 0
+        return ratio, round(buy * 100, 1), round(sell * 100, 1)
     except Exception as e:
         print(f"L/S error {symbol}: {e}")
     return None, None, None
 
 
 def fetch_top_trader(symbol):
-    try:
-        r = requests.get(
-            "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
-            params={"symbol": symbol, "period": "1h", "limit": 1},
-            timeout=10
-        )
-        data = r.json()
-        if data and isinstance(data, list):
-            long  = float(data[0].get("longAccount", 0)) * 100
-            short = float(data[0].get("shortAccount", 0)) * 100
-            return round(long, 1), round(short, 1)
-    except Exception as e:
-        print(f"Top trader error {symbol}: {e}")
     return None, None
+
 
 
 def calc_ema_series(closes, period):
