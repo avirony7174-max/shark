@@ -9,6 +9,10 @@ CORS(app)
 CG_BASE = "https://open-api-v4.coinglass.com/api"
 CG_KEY = os.environ.get("COINGLASS_API_KEY", "")
 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TV_WEBHOOK_SECRET = os.environ.get("TV_WEBHOOK_SECRET", "mysecret")
+
 COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LTC"]
 
 COINGECKO_IDS = {
@@ -30,8 +34,24 @@ def cg_headers():
     }
 
 
+def send_telegram(message):
+    try:
+        token = TELEGRAM_BOT_TOKEN
+        chat_id = TELEGRAM_CHAT_ID
+        if not token or not chat_id:
+            print("Telegram credentials missing")
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=10)
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+
 def fetch_prices():
-    """CoinGecko free API — price, change, volume"""
     try:
         ids = ",".join(COINGECKO_IDS.values())
         r = requests.get(
@@ -62,7 +82,6 @@ def fetch_prices():
 
 
 def fetch_liquidation_data():
-    """Liquidation data — confirmed Hobbyist"""
     try:
         r = requests.get(
             f"{CG_BASE}/futures/liquidation/coin-list",
@@ -85,7 +104,6 @@ def fetch_liquidation_data():
 
 
 def fetch_oi_data():
-    """Open Interest — confirmed Hobbyist"""
     try:
         result = {}
         for coin in COINS:
@@ -114,9 +132,6 @@ def fetch_oi_data():
 
 
 def fetch_funding_data():
-    """Funding Rate — confirmed Hobbyist
-    Response: data = [{symbol, stablecoin_margin_list: [{exchange, funding_rate}], token_margin_list}]
-    """
     try:
         result = {}
         for coin in COINS:
@@ -132,10 +147,8 @@ def fetch_funding_data():
                 for item in items:
                     if not isinstance(item, dict):
                         continue
-                    # Match symbol
                     if item.get("symbol", "").upper() != coin.upper():
                         continue
-                    # Get Binance from stablecoin_margin_list
                     stablelist = item.get("stablecoin_margin_list", [])
                     binance = next(
                         (x for x in stablelist if x.get("exchange") == "Binance"),
@@ -189,6 +202,46 @@ def scan():
 
     out.sort(key=lambda x: abs(float(x["change"])), reverse=True)
     return jsonify({"coins": out, "status": "ok"})
+
+
+@app.route("/tv/<secret>", methods=["POST"])
+def tradingview_webhook(secret):
+    if secret != TV_WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    try:
+        data = request.get_json(force=True) or {}
+        signal    = data.get("signal", "").upper()
+        symbol    = data.get("symbol", "BTCUSDT")
+        timeframe = data.get("timeframe", "Daily")
+        entry     = data.get("entry", "—")
+        sl        = data.get("sl", "—")
+        tp        = data.get("tp", "—")
+
+        if signal == "LONG":
+            emoji = "🟢"
+            label = "LONG SIGNAL"
+        elif signal == "SHORT":
+            emoji = "🔴"
+            label = "SHORT SIGNAL"
+        else:
+            return jsonify({"status": "ignored"}), 200
+
+        message = (
+            f"{emoji} <b>{label}</b>\n"
+            f"<b>{symbol}</b> · {timeframe}\n\n"
+            f"Entry:  <code>{entry}</code>\n"
+            f"SL:       <code>{sl}</code>\n"
+            f"TP:       <code>{tp}</code>\n\n"
+            f"<i>Daily EMA Swing 21/50</i>"
+        )
+
+        send_telegram(message)
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
