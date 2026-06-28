@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import requests
@@ -298,8 +299,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in VALID_COINS:
         symbol = VALID_COINS[text]
         await update.message.reply_text("⏳ Fetching data...")
-        msg = get_full_analysis(symbol)
-        await update.message.reply_text(msg, parse_mode="HTML")
+        try:
+            loop = asyncio.get_event_loop()
+            msg = await loop.run_in_executor(None, get_full_analysis, symbol)
+            await update.message.reply_text(msg, parse_mode="HTML")
+        except Exception as e:
+            print(f"handle_message error: {e}")
+            await update.message.reply_text("❌ Error fetching data. Try again.")
     else:
         await update.message.reply_text(
             "Send a coin name:\n<b>BTC · ETH · SOL · LINK</b>",
@@ -369,7 +375,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot polling started")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
