@@ -38,9 +38,10 @@ SR_LOOKBACK    = 5      # candles each side to confirm a swing high/low
 SR_TOLERANCE   = 0.015  # cluster swing points within 1.5% as one level
 SR_LEVELS      = 2      # how many S/R levels to keep internally each side
 
-LIQ_BUCKET_PCT = 0.002  # 0.2% price bucket width for order book clustering
-LIQ_CLUSTERS   = 2      # how many liquidity walls to keep internally each side
-LIQ_DEPTH      = 500    # order book depth to fetch
+LIQ_BUCKET_PCT   = 0.002  # 0.2% price bucket width for order book clustering
+LIQ_DEPTH        = 500    # order book depth to fetch
+LIQ_MIN_GAP_MULT = 0.5    # buckets within 0.5 bucket-widths of price are "at market", not a wall
+LIQ_SIG_MULT     = 1.5    # a bucket must be >= 1.5x the median bucket size to count as "significant"
 
 # Confidence weights (section 10 of spec). NOTE: as given these summed to
 # 110%, not 100% (25+10+10+10+15+15+15+10). Rather than silently rescale the
@@ -198,24 +199,6 @@ def fetch_taker_volume(symbol):
     return None, None
 
 
-def fetch_ls_ratio(symbol):
-    try:
-        r = requests.get(
-            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-            params={"symbol": symbol, "period": "1h", "limit": 1},
-            timeout=10
-        )
-        data = r.json()
-        if data and isinstance(data, list):
-            ratio = float(data[0].get("longShortRatio", 0))
-            long  = float(data[0].get("longAccount", 0)) * 100
-            short = float(data[0].get("shortAccount", 0)) * 100
-            return round(ratio, 2), round(long, 1), round(short, 1)
-    except Exception as e:
-        print(f"L/S error {symbol}: {e}")
-    return None, None, None
-
-
 def fetch_top_trader(symbol):
     try:
         r = requests.get(
@@ -233,10 +216,24 @@ def fetch_top_trader(symbol):
     return None, None
 
 
-def fetch_order_book_clusters(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT,
-                               num_clusters=LIQ_CLUSTERS, depth_limit=LIQ_DEPTH):
+def fetch_liquidity_walls(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT, depth_limit=LIQ_DEPTH,
+                           min_gap_mult=LIQ_MIN_GAP_MULT, sig_mult=LIQ_SIG_MULT):
+    """
+    Returns (buy_wall, sell_wall), each either (price, notional_usd) or None.
+
+    Bug this replaces: the old version picked the single largest notional
+    bucket on each side, full stop. Real order books are always densest at
+    the touch (best bid/ask), so that bucket — sitting ~0% away from price —
+    almost always won, making the bot report a "wall" exactly at market
+    price. Fixed by (1) excluding any bucket within half a bucket-width of
+    price (the "at market" zone isn't a wall, it's just the spread), then
+    (2) requiring a bucket's notional to be at least `sig_mult`x the median
+    bucket size on that side to count as "significant", then (3) picking the
+    NEAREST bucket that clears that bar — not the biggest one overall, which
+    could be far away and less actionable.
+    """
     if not current_price:
-        return [], []
+        return None, None
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/depth",
@@ -249,29 +246,51 @@ def fetch_order_book_clusters(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT,
 
         bucket_size = current_price * bucket_pct
         if bucket_size <= 0:
-            return [], []
+            return None, None
+        min_gap = bucket_size * min_gap_mult
 
-        def cluster_side(orders):
+        def build_buckets(orders):
             buckets = {}
             for p_str, q_str in orders:
                 p = float(p_str)
                 q = float(q_str)
-                notional = p * q
                 key = round(p / bucket_size) * bucket_size
-                buckets[key] = buckets.get(key, 0) + notional
-            ranked = sorted(buckets.items(), key=lambda x: -x[1])
-            return ranked[:num_clusters]
+                buckets[key] = buckets.get(key, 0) + p * q
+            return buckets
 
-        bid_clusters = cluster_side(bids)   # support-side liquidity (below price)
-        ask_clusters = cluster_side(asks)   # resistance-side liquidity (above price)
+        def nearest_significant(buckets, direction):
+            if not buckets:
+                return None
+            values = list(buckets.values())
+            values.sort()
+            mid = len(values) // 2
+            median_val = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+            threshold = median_val * sig_mult
 
-        ask_clusters.sort(key=lambda x: x[0])    # nearest resistance wall first
-        bid_clusters.sort(key=lambda x: -x[0])   # nearest support wall first
+            if direction == "above":
+                far_enough = {lvl: n for lvl, n in buckets.items() if lvl > current_price + min_gap}
+            else:
+                far_enough = {lvl: n for lvl, n in buckets.items() if lvl < current_price - min_gap}
+            if not far_enough:
+                return None
 
-        return bid_clusters, ask_clusters
+            significant = {lvl: n for lvl, n in far_enough.items() if n >= threshold}
+            pool = significant if significant else far_enough  # fall back rather than return nothing
+            if direction == "above":
+                lvl = min(pool.keys())
+            else:
+                lvl = max(pool.keys())
+            return (lvl, pool[lvl])
+
+        ask_buckets = build_buckets(asks)
+        bid_buckets = build_buckets(bids)
+
+        sell_wall = nearest_significant(ask_buckets, "above")
+        buy_wall  = nearest_significant(bid_buckets, "below")
+        return buy_wall, sell_wall
     except Exception as e:
-        print(f"Order book error {symbol}: {e}")
-        return [], []
+        print(f"Liquidity wall error {symbol}: {e}")
+        return None, None
 
 
 # ============================================================================
@@ -327,6 +346,100 @@ def rsi_label(rsi):
     if rsi > 70:
         return f"<code>{rsi}</code> (Overbought)"
     return f"<code>{rsi}</code> (Neutral)"
+
+
+def ema_arrow(series, lookback=3):
+    """▲/▼ based on whether the EMA is higher or lower than `lookback` candles ago."""
+    if not series or len(series) <= lookback:
+        return ""
+    return "▲" if series[-1] > series[-1 - lookback] else "▼"
+
+
+def momentum_label(ef, es, rsi):
+    """Heuristic composite of EMA-gap size + RSI distance from neutral 50."""
+    if ef is None or es is None or not es:
+        return "Weak"
+    gap_pct = abs(ef - es) / es * 100
+    rsi_dev = abs((rsi if rsi is not None else 50) - 50)
+    score = gap_pct * 8 + rsi_dev * 0.6
+    if score >= 12:
+        return "Strong"
+    if score >= 5:
+        return "Moderate"
+    return "Weak"
+
+
+def oi_trend_label(oi_change):
+    if oi_change is None:
+        return "—"
+    if oi_change > 1:
+        return "Increasing"
+    if oi_change < -1:
+        return "Decreasing"
+    return "Flat"
+
+
+def crowd_label(funding, oi_change):
+    if funding is None:
+        return ""
+    rising = oi_change is None or oi_change >= 0
+    if funding > 0.02 and rising:
+        return "Crowded Long"
+    if funding < -0.02 and rising:
+        return "Crowded Short"
+    return "Balanced"
+
+
+def volume_status(c_vol, vol_avg):
+    """Returns (pct_of_avg, status_label)."""
+    if not vol_avg:
+        return None, "—"
+    pct = round(c_vol / vol_avg * 100)
+    if pct >= 130:
+        return pct, "High Volume"
+    if pct <= 70:
+        return pct, "Low Volume"
+    return pct, "Above Average" if pct >= 100 else "Below Average"
+
+
+def dot(score):
+    """Generic 0-100 bullish-scale score -> 🟢/🟡/🔴."""
+    if score is None:
+        return "⚪"
+    if score >= 60:
+        return "🟢"
+    if score <= 40:
+        return "🔴"
+    return "🟡"
+
+
+def momentum_dot(mom_label, bull_trend, bear_trend):
+    if mom_label == "Strong":
+        return "🟢" if bull_trend else ("🔴" if bear_trend else "🟡")
+    if mom_label == "Weak":
+        return "🔴"
+    return "🟡"
+
+
+def volume_dot(status):
+    if status == "High Volume":
+        return "🟢"
+    if status == "Low Volume":
+        return "🔴"
+    return "🟡"
+
+
+def overall_bias_label(score):
+    if score >= 70:
+        return "Strongly bullish"
+    if score >= 55:
+        return "Bullish but waiting for confirmation"
+    if score >= 45:
+        return "Neutral / ranging"
+    if score >= 30:
+        return "Bearish but waiting for confirmation"
+    return "Strongly bearish"
+
 
 
 def calc_support_resistance(candles, current_price, lookback=SR_LOOKBACK,
@@ -499,11 +612,11 @@ def score_oi(oi_change):
     return 50
 
 
-def score_liquidity(price, ask_clusters, bid_clusters):
-    if not ask_clusters and not bid_clusters:
+def score_liquidity(price, sell_wall, buy_wall):
+    if not sell_wall and not buy_wall:
         return 50
-    ask_dist = (ask_clusters[0][0] - price) / price * 100 if ask_clusters else 999
-    bid_dist = (price - bid_clusters[0][0]) / price * 100 if bid_clusters else 999
+    ask_dist = (sell_wall[0] - price) / price * 100 if sell_wall else 999
+    bid_dist = (price - buy_wall[0]) / price * 100 if buy_wall else 999
     if ask_dist < bid_dist:
         return 35   # resistance wall closer -> bearish tilt
     if bid_dist < ask_dist:
@@ -529,17 +642,43 @@ def score_sr(price, support, resistance):
     return 50
 
 
+def calc_bullish_score(scores):
+    """Direction-agnostic 0-100 'how bullish is the market overall' score —
+    used both as the Market Score and as the base for calc_confidence()."""
+    weight_sum = sum(CONF_WEIGHTS.values())
+    return sum(scores[k] * CONF_WEIGHTS[k] for k in CONF_WEIGHTS) / weight_sum
+
+
 def calc_confidence(scores, direction):
     """scores: dict matching CONF_WEIGHTS keys, each 0-100 bullishness.
     Normalizes by the *actual* weight sum (see CONF_WEIGHTS comment)."""
-    weight_sum = sum(CONF_WEIGHTS.values())
-    bullish_total = sum(scores[k] * CONF_WEIGHTS[k] for k in CONF_WEIGHTS) / weight_sum
+    bullish_total = calc_bullish_score(scores)
     return round(bullish_total if direction == "LONG" else 100 - bullish_total)
 
 
-def confidence_stars(confidence):
-    stars = max(1, min(5, round(confidence / 20)))
-    return "⭐" * stars + "☆" * (5 - stars)
+CONF_LABELS = {
+    "trend": "Trend", "rsi": "RSI", "volume": "Vol", "funding": "Fund",
+    "oi": "OI", "liquidity": "Liq", "whale": "Whale", "sr": "S/R",
+}
+
+
+def confidence_breakdown(scores, direction, top_n=3):
+    """Signed point contribution of each factor toward the confidence score,
+    e.g. 'Trend+25 RSI+7 Fund-3'. Contributions sum exactly to (confidence-50)."""
+    weight_sum = sum(CONF_WEIGHTS.values())
+    contribs = {}
+    for k in CONF_WEIGHTS:
+        raw = (scores[k] - 50) * CONF_WEIGHTS[k] / weight_sum
+        contribs[k] = raw if direction == "LONG" else -raw
+
+    ranked = sorted(contribs.items(), key=lambda x: -abs(x[1]))
+    parts = []
+    for k, v in ranked[:top_n]:
+        if abs(v) < 0.5:
+            continue
+        sign = "+" if v >= 0 else ""
+        parts.append(f"{CONF_LABELS[k]}{sign}{round(v)}")
+    return " ".join(parts)
 
 
 def calc_risk_level(funding, oi_change, rsi, trend_clear, whale_skew):
@@ -581,15 +720,12 @@ def whale_interpretation(tt_long, taker_buy):
     return "Neutral ⚪"
 
 
-def volume_read(c_vol, vol_avg):
-    if not vol_avg:
-        return "—"
-    ratio = c_vol / vol_avg
-    if ratio >= 1.3:
-        return f"High (<code>{ratio:.2f}x</code> avg) — strong breakout support"
-    if ratio <= 0.7:
-        return f"Low (<code>{ratio:.2f}x</code> avg) — weak breakout risk"
-    return f"Average (<code>{ratio:.2f}x</code> avg)"
+def build_wait_levels(bull_trend, bear_trend, ef, es, nearest_r, nearest_s):
+    """Actionable trigger levels for the WAIT recommendation."""
+    bull_entry = nearest_r[0] if nearest_r else ef
+    bear_entry = nearest_s[0] if nearest_s else es
+    invalidation = es if (bull_trend or bear_trend) else ef
+    return bull_entry, bear_entry, invalidation
 
 
 def build_wait_reasons(bull_trend, bear_trend, near_resistance, near_support, funding):
@@ -646,14 +782,13 @@ def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
     coin = symbol.replace("USDT", "")
 
     # Independent API calls run concurrently to cut total latency.
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=7) as ex:
         f_ticker  = ex.submit(fetch_price_ticker, symbol)
         f_candles = ex.submit(fetch_candles, symbol, tf_binance, CANDLE_LIMIT)
         f_oi      = ex.submit(fetch_oi, symbol)
         f_oichg   = ex.submit(fetch_oi_change, symbol, tf_binance)
         f_funding = ex.submit(fetch_funding, symbol)
         f_taker   = ex.submit(fetch_taker_volume, symbol)
-        f_ls      = ex.submit(fetch_ls_ratio, symbol)
         f_tt      = ex.submit(fetch_top_trader, symbol)
 
         ticker    = f_ticker.result()
@@ -661,36 +796,38 @@ def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
         oi        = f_oi.result()
         oi_change = f_oichg.result()
         funding   = f_funding.result()
-        buy_pct, sell_pct           = f_taker.result()
-        ls_ratio, ls_long, ls_short = f_ls.result()
-        tt_long, tt_short           = f_tt.result()
+        buy_pct, sell_pct = f_taker.result()
+        tt_long, tt_short = f_tt.result()
 
     price  = ticker.get("price", 0)
     change = ticker.get("change", 0)
 
-    # Order book + S/R both need `price`; order book is still its own network
-    # call so it runs concurrently with the (local, non-network) S/R calc.
+    # Liquidity walls + S/R both need `price`; walls are still a network call
+    # so they run concurrently with the (local, non-network) S/R calc.
     with ThreadPoolExecutor(max_workers=1) as ex:
-        f_ob = ex.submit(fetch_order_book_clusters, symbol, price)
+        f_liq = ex.submit(fetch_liquidity_walls, symbol, price)
         support, resistance = calc_support_resistance(candles, price) if candles else ([], [])
-        bid_clusters, ask_clusters = f_ob.result()
+        buy_wall, sell_wall = f_liq.result()
 
     sig = check_signal(candles) if candles else None
 
     closes  = [c["close"]  for c in candles] if candles else []
     volumes = [c["volume"] for c in candles] if candles else []
 
-    ef  = round(calc_ema_series(closes, EMA_FAST)[-1], 2) if len(closes) >= EMA_FAST else None
-    es  = round(calc_ema_series(closes, EMA_SLOW)[-1], 2) if len(closes) >= EMA_SLOW else None
+    ema21_series = calc_ema_series(closes, EMA_FAST) if len(closes) >= EMA_FAST else []
+    ema50_series = calc_ema_series(closes, EMA_SLOW) if len(closes) >= EMA_SLOW else []
+    ef  = round(ema21_series[-1], 2) if ema21_series else None
+    es  = round(ema50_series[-1], 2) if ema50_series else None
     rsi = calc_rsi(closes)
 
     bull_trend = isinstance(ef, float) and isinstance(es, float) and ef > es
     bear_trend = isinstance(ef, float) and isinstance(es, float) and ef < es
-    bias = "Bullish ✅" if bull_trend else ("Bearish ❌" if bear_trend else "Flat ⚪")
+    cross_label = "Bullish" if bull_trend else ("Bearish" if bear_trend else "Flat")
 
     vol_avg = calc_sma(volumes[:-1], VOL_SMA) if len(volumes) > VOL_SMA else 0
     c_vol   = volumes[-2] if len(volumes) >= 2 else 0
     vol_ok  = c_vol > vol_avg if vol_avg else False
+    vol_pct, vol_status_label = volume_status(c_vol, vol_avg)
 
     nearest_r = resistance[0] if resistance else None
     nearest_s = support[0] if support else None
@@ -700,104 +837,128 @@ def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
     near_support    = s_dist is not None and s_dist < 1.5
 
     whale_skew = (tt_long - 50) if tt_long is not None else None
+    momentum   = momentum_label(ef, es, rsi)
 
-    # ---- Confidence / Risk ----
+    # ---- Scoring: Confidence, Market Score, Risk ----
     scores = {
         "trend":     score_trend(ef, es),
         "rsi":       score_rsi(rsi),
         "volume":    score_volume(c_vol, vol_avg),
         "funding":   score_funding(funding),
         "oi":        score_oi(oi_change),
-        "liquidity": score_liquidity(price, ask_clusters, bid_clusters),
+        "liquidity": score_liquidity(price, sell_wall, buy_wall),
         "whale":     score_whale(tt_long, buy_pct),
         "sr":        score_sr(price, support, resistance),
     }
-    direction  = sig["type"] if sig else ("LONG" if bull_trend else "SHORT")
-    confidence = calc_confidence(scores, direction)
-    risk_level = calc_risk_level(funding, oi_change, rsi, bull_trend or bear_trend, whale_skew)
+    bullish_score = calc_bullish_score(scores)   # 0-100, direction-agnostic
+    direction     = sig["type"] if sig else ("LONG" if bull_trend else "SHORT")
+    confidence    = calc_confidence(scores, direction)
+    conf_why      = confidence_breakdown(scores, direction)
+    risk_level    = calc_risk_level(funding, oi_change, rsi, bull_trend or bear_trend, whale_skew)
 
-    # ---- Display lines ----
+    # ---- Display formatting ----
     ch_icon = "▲" if change >= 0 else "▼"
     ch_sign = "+" if change >= 0 else ""
+    ef_disp = ef if ef is not None else "—"
+    es_disp = es if es is not None else "—"
+    ef_arr  = ema_arrow(ema21_series)
+    es_arr  = ema_arrow(ema50_series)
 
-    ef_disp  = ef if ef is not None else "—"
-    es_disp  = es if es is not None else "—"
+    r_disp = f"<code>${nearest_r[0]:,.2f}</code> +{r_dist:.2f}%" if nearest_r else "—"
+    s_disp = f"<code>${nearest_s[0]:,.2f}</code> -{s_dist:.2f}%" if nearest_s else "—"
 
-    oi_line      = f"<code>{oi}B</code>" if oi else "—"
-    oi_chg_sign  = "+" if oi_change is not None and oi_change >= 0 else ""
-    oi_chg_line  = f"<code>{oi_chg_sign}{oi_change}%</code>" if oi_change is not None else "—"
-    f_sign       = "+" if funding is not None and funding >= 0 else ""
-    f_pay        = "Longs pay" if funding is not None and funding >= 0 else "Shorts pay"
-    funding_line = f"<code>{f_sign}{funding}%</code> ({f_pay})" if funding is not None else "—"
+    oi_disp     = f"<code>{oi}B</code>" if oi else "—"
+    oi_chg_sign = "+" if oi_change is not None and oi_change >= 0 else ""
+    oi_line     = f"OI {oi_disp}"
+    if oi_change is not None:
+        oi_line += f" <code>{oi_chg_sign}{oi_change}%</code>  {oi_trend_label(oi_change)}"
 
-    r_line = (f"<code>${nearest_r[0]:,.2f}</code> (+{r_dist:.2f}%)" if nearest_r else "—")
-    s_line = (f"<code>${nearest_s[0]:,.2f}</code> (-{s_dist:.2f}%)" if nearest_s else "—")
+    f_sign  = "+" if funding is not None and funding >= 0 else ""
+    f_pay   = "Longs pay" if funding is not None and funding >= 0 else "Shorts pay"
+    f_crowd = crowd_label(funding, oi_change)
+    funding_line = (f"Funding <code>{f_sign}{funding}%</code> {f_pay} · {f_crowd}"
+                     if funding is not None else "Funding —")
 
-    if ask_clusters:
-        a_lvl, a_val = ask_clusters[0]
-        a_dist = (a_lvl - price) / price * 100 if price else 0
-        sell_wall_line = f"<code>${a_lvl:,.2f}</code>  +{a_dist:.2f}%  (${a_val/1e6:.1f}M)"
+    if sell_wall:
+        sw_lvl, sw_val = sell_wall
+        sw_dist = (sw_lvl - price) / price * 100 if price else 0
+        sell_line = f"Sell Wall <code>${sw_lvl:,.2f}</code> +{sw_dist:.2f}% (${sw_val/1e6:.1f}M)"
     else:
-        sell_wall_line = "—"
-    if bid_clusters:
-        b_lvl, b_val = bid_clusters[0]
-        b_dist = (price - b_lvl) / price * 100 if price else 0
-        buy_wall_line = f"<code>${b_lvl:,.2f}</code>  -{b_dist:.2f}%  (${b_val/1e6:.1f}M)"
+        sell_line = "Sell Wall —"
+    if buy_wall:
+        bw_lvl, bw_val = buy_wall
+        bw_dist = (price - bw_lvl) / price * 100 if price else 0
+        buy_line = f"Buy Wall  <code>${bw_lvl:,.2f}</code> -{bw_dist:.2f}% (${bw_val/1e6:.1f}M)"
     else:
-        buy_wall_line = "—"
+        buy_line = "Buy Wall  —"
 
-    taker_line = f"B<code>{buy_pct}%</code>/S<code>{sell_pct}%</code>" if buy_pct is not None else "—"
-    tt_line    = f"L<code>{tt_long}%</code>/S<code>{tt_short}%</code>" if tt_long is not None else "—"
     whale_read = whale_interpretation(tt_long, buy_pct)
-    vol_line   = volume_read(c_vol, vol_avg)
+    tt_disp    = f"{tt_long}%" if tt_long is not None else "—"
+    buy_disp   = f"{buy_pct}%" if buy_pct is not None else "—"
+    whale_line = f"Top <code>{tt_disp}</code> Long · Taker <code>{buy_disp}</code> Buy → {whale_read}"
 
-    stars = confidence_stars(confidence)
+    vol_disp = f"<code>{vol_pct}%</code> avg — {vol_status_label}" if vol_pct is not None else "—"
+
+    market_dots = (
+        f"Trend{dot(scores['trend'])} Mom{momentum_dot(momentum, bull_trend, bear_trend)} "
+        f"Liq{dot(scores['liquidity'])} Fund{dot(scores['funding'])} "
+        f"Whale{dot(scores['whale'])} Vol{volume_dot(vol_status_label)}"
+    )
+    overall_score = round(bullish_score)
+    signal_tag    = "  (Signal Active)" if sig else ""
+    overall_line  = f"Overall <code>{overall_score}/100</code> — {overall_bias_label(overall_score)}{signal_tag} · Risk {risk_level}"
+
+    conf_disp = f"Confidence <code>{confidence}%</code>" + (f"  ({conf_why})" if conf_why else "")
 
     if sig:
         emoji = "🎯" if sig["type"] == "LONG" else "🔻"
         reasons = build_signal_reasons(sig["type"], vol_ok, True)
-        reason_line = " · ".join(reasons)
+        risk_reward = abs(sig["tp"] - sig["entry"]) / abs(sig["entry"] - sig["sl"]) if sig["entry"] != sig["sl"] else 0
         rec_block = (
             f"{emoji} <b>Recommendation: {sig['type']}</b>\n"
-            f"Confidence: <code>{confidence}%</code> {stars}\n"
-            f"Entry: <code>{sig['entry']}</code>  SL: <code>{sig['sl']}</code>  TP: <code>{sig['tp']}</code>\n"
-            f"Reason: {reason_line}"
+            f"{conf_disp}\n"
+            f"Entry <code>{sig['entry']}</code>  SL <code>{sig['sl']}</code>  TP <code>{sig['tp']}</code>\n"
+            f"Risk:Reward <code>1:{risk_reward:.1f}</code>\n"
+            f"Reason: {' · '.join(reasons)}"
         )
     else:
+        bull_entry, bear_entry, invalidation = build_wait_levels(bull_trend, bear_trend, ef, es, nearest_r, nearest_s)
         reasons = build_wait_reasons(bull_trend, bear_trend, near_resistance, near_support, funding)
-        reason_line = " · ".join(reasons)
-        watch = ("Break above EMA21" if bear_trend else "Break below Support") if not bull_trend else "Break above resistance"
+        be_disp = f"<code>${bull_entry:,.2f}</code>" if bull_entry else "—"
+        se_disp = f"<code>${bear_entry:,.2f}</code>" if bear_entry else "—"
+        inv_disp = f"<code>${invalidation:,.2f}</code>" if invalidation else "—"
         rec_block = (
             f"⏳ <b>Recommendation: WAIT</b>\n"
-            f"Confidence: <code>{confidence}%</code> {stars}\n"
-            f"Reason: {reason_line}\n"
-            f"Watch: {watch}"
+            f"{conf_disp}\n"
+            f"Bull Entry Above {be_disp}   Bear Entry Below {se_disp}\n"
+            f"Invalidation {inv_disp}\n"
+            f"Reason: {' · '.join(reasons)}"
         )
 
     return (
-        f"📊 <b>{coin}/USDT Analysis</b>  ⏰ <b>{tf_label}</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"Price: <code>${price:,.2f}</code>  {ch_icon}{ch_sign}{change}%\n"
+        f"📊 <b>{coin}/USDT</b> ⏰ <b>{tf_label}</b>   <code>${price:,.2f}</code>  {ch_icon}{ch_sign}{change}%\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 <b>Trend</b>\n"
-        f"EMA21: <code>{ef_disp}</code>  EMA50: <code>{es_disp}</code>\n"
-        f"RSI14: {rsi_label(rsi)}\n"
-        f"Bias: {bias}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📐 <b>S/R</b>   R: {r_line}   S: {s_line}\n"
+        f"EMA21{ef_arr} <code>{ef_disp}</code>  EMA50{es_arr} <code>{es_disp}</code>\n"
+        f"Cross {cross_label} · RSI {rsi_label(rsi)} · Momentum {momentum}\n"
+        f"Resistance {r_disp}   Support {s_disp}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📊 <b>Futures</b>\n"
-        f"OI: {oi_line}  Δ{tf_label}: {oi_chg_line}\n"
-        f"Funding: {funding_line}\n"
+        f"{oi_line}\n"
+        f"{funding_line}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"💧 <b>Liquidity</b>\n"
-        f"Sell Wall: {sell_wall_line}\n"
-        f"Buy Wall:   {buy_wall_line}\n"
+        f"{sell_line}\n"
+        f"{buy_line}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🐋 <b>Whales</b>  Top {tt_line}  Taker {taker_line}  → {whale_read}\n"
+        f"🐋 <b>Whales</b>\n"
+        f"{whale_line}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"📦 Volume: {vol_line}\n"
-        f"⚠️ Risk: {risk_level}\n"
+        f"📦 Volume {vol_disp}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Market Score</b>\n"
+        f"{market_dots}\n"
+        f"{overall_line}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{rec_block}"
     )
