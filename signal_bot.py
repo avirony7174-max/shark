@@ -3,7 +3,6 @@ import os
 import time
 import requests
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -19,49 +18,19 @@ VALID_COINS = {
     "LINK": "LINKUSDT",
 }
 
-# ---- Timeframes -----------------------------------------------------------
-# User can type "BTC", "BTC 1H", "BTC 15M" etc. Default is 1H.
-# Binance klines + openInterestHist both accept these exact period strings,
-# so one alias map covers both candle fetching and OI-change lookups.
-TIMEFRAME_ALIASES = {"15M": "15m", "30M": "30m", "1H": "1h", "4H": "4h", "1D": "1d"}
-DEFAULT_TF_LABEL  = "1H"
-AUTO_SIGNAL_TF    = "1d"   # auto signal loop stays on Daily (kept configurable here)
-
 EMA_FAST       = 21
 EMA_SLOW       = 50
-RSI_PERIOD     = 14
 VOL_SMA        = 10
 CHECK_INTERVAL = 900
-CANDLE_LIMIT   = 100
 
 SR_LOOKBACK    = 5      # candles each side to confirm a swing high/low
 SR_TOLERANCE   = 0.015  # cluster swing points within 1.5% as one level
-SR_LEVELS      = 2      # how many S/R levels to keep internally each side
+SR_LEVELS      = 2      # how many S/R levels to show each side
 
-LIQ_BUCKET_PCT   = 0.002  # 0.2% price bucket width for order book clustering
-LIQ_DEPTH        = 500    # order book depth to fetch
-LIQ_MIN_GAP_MULT = 0.5    # buckets within 0.5 bucket-widths of price are "at market", not a wall
-LIQ_SIG_MULT     = 1.5    # a bucket must be >= 1.5x the median bucket size to count as "significant"
+LIQ_BUCKET_PCT = 0.002  # 0.2% price bucket width for order book clustering
+LIQ_CLUSTERS   = 2      # how many liquidity walls to show each side
+LIQ_DEPTH      = 500    # order book depth to fetch
 
-# Confidence weights (section 10 of spec). NOTE: as given these summed to
-# 110%, not 100% (25+10+10+10+15+15+15+10). Rather than silently rescale the
-# numbers you gave, calc_confidence() below normalizes by the *actual* sum
-# of these weights, so the output is still a clean 0-100 score regardless.
-CONF_WEIGHTS = {
-    "trend":     25,
-    "rsi":       10,
-    "volume":    10,
-    "funding":   10,
-    "oi":        15,
-    "liquidity": 15,
-    "whale":     15,
-    "sr":        10,
-}
-
-
-# ============================================================================
-# Telegram
-# ============================================================================
 
 def send_telegram(message):
     try:
@@ -75,21 +44,16 @@ def send_telegram(message):
         print(f"Telegram error: {e}")
 
 
-# ============================================================================
-# Binance fetchers
-# ============================================================================
-
-def fetch_candles(symbol, interval="1h", limit=CANDLE_LIMIT):
-    """Generic replacement for the old fetch_daily_candles() — any timeframe."""
+def fetch_daily_candles(symbol, limit=60):
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
+            params={"symbol": symbol, "interval": "1d", "limit": limit},
             timeout=10
         )
         data = r.json()
         if not isinstance(data, list):
-            print(f"Binance klines error {symbol} {interval}: {data}")
+            print(f"Binance klines error {symbol}: {data}")
             return []
         candles = []
         for c in data:
@@ -102,7 +66,7 @@ def fetch_candles(symbol, interval="1h", limit=CANDLE_LIMIT):
             })
         return candles
     except Exception as e:
-        print(f"Binance candle error {symbol} {interval}: {e}")
+        print(f"Binance candle error {symbol}: {e}")
         return []
 
 
@@ -145,25 +109,6 @@ def fetch_oi(symbol):
     return None
 
 
-def fetch_oi_change(symbol, period="1h", limit=2):
-    """% change in open interest over one period, using Binance's OI history."""
-    try:
-        r = requests.get(
-            "https://fapi.binance.com/futures/data/openInterestHist",
-            params={"symbol": symbol, "period": period, "limit": limit},
-            timeout=10
-        )
-        data = r.json()
-        if isinstance(data, list) and len(data) >= 2:
-            old = float(data[0].get("sumOpenInterestValue", 0))
-            new = float(data[-1].get("sumOpenInterestValue", 0))
-            if old > 0:
-                return round((new - old) / old * 100, 2)
-    except Exception as e:
-        print(f"OI change error {symbol}: {e}")
-    return None
-
-
 def fetch_funding(symbol):
     try:
         r = requests.get(
@@ -199,6 +144,24 @@ def fetch_taker_volume(symbol):
     return None, None
 
 
+def fetch_ls_ratio(symbol):
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+            params={"symbol": symbol, "period": "1h", "limit": 1},
+            timeout=10
+        )
+        data = r.json()
+        if data and isinstance(data, list):
+            ratio = float(data[0].get("longShortRatio", 0))
+            long  = float(data[0].get("longAccount", 0)) * 100
+            short = float(data[0].get("shortAccount", 0)) * 100
+            return round(ratio, 2), round(long, 1), round(short, 1)
+    except Exception as e:
+        print(f"L/S error {symbol}: {e}")
+    return None, None, None
+
+
 def fetch_top_trader(symbol):
     try:
         r = requests.get(
@@ -216,24 +179,10 @@ def fetch_top_trader(symbol):
     return None, None
 
 
-def fetch_liquidity_walls(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT, depth_limit=LIQ_DEPTH,
-                           min_gap_mult=LIQ_MIN_GAP_MULT, sig_mult=LIQ_SIG_MULT):
-    """
-    Returns (buy_wall, sell_wall), each either (price, notional_usd) or None.
-
-    Bug this replaces: the old version picked the single largest notional
-    bucket on each side, full stop. Real order books are always densest at
-    the touch (best bid/ask), so that bucket — sitting ~0% away from price —
-    almost always won, making the bot report a "wall" exactly at market
-    price. Fixed by (1) excluding any bucket within half a bucket-width of
-    price (the "at market" zone isn't a wall, it's just the spread), then
-    (2) requiring a bucket's notional to be at least `sig_mult`x the median
-    bucket size on that side to count as "significant", then (3) picking the
-    NEAREST bucket that clears that bar — not the biggest one overall, which
-    could be far away and less actionable.
-    """
+def fetch_order_book_clusters(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT,
+                               num_clusters=LIQ_CLUSTERS, depth_limit=LIQ_DEPTH):
     if not current_price:
-        return None, None
+        return [], []
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/depth",
@@ -246,56 +195,30 @@ def fetch_liquidity_walls(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT, dept
 
         bucket_size = current_price * bucket_pct
         if bucket_size <= 0:
-            return None, None
-        min_gap = bucket_size * min_gap_mult
+            return [], []
 
-        def build_buckets(orders):
+        def cluster_side(orders):
             buckets = {}
             for p_str, q_str in orders:
                 p = float(p_str)
                 q = float(q_str)
+                notional = p * q
                 key = round(p / bucket_size) * bucket_size
-                buckets[key] = buckets.get(key, 0) + p * q
-            return buckets
+                buckets[key] = buckets.get(key, 0) + notional
+            ranked = sorted(buckets.items(), key=lambda x: -x[1])
+            return ranked[:num_clusters]
 
-        def nearest_significant(buckets, direction):
-            if not buckets:
-                return None
-            values = list(buckets.values())
-            values.sort()
-            mid = len(values) // 2
-            median_val = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
-            threshold = median_val * sig_mult
+        bid_clusters = cluster_side(bids)   # support-side liquidity (below price)
+        ask_clusters = cluster_side(asks)   # resistance-side liquidity (above price)
 
-            if direction == "above":
-                far_enough = {lvl: n for lvl, n in buckets.items() if lvl > current_price + min_gap}
-            else:
-                far_enough = {lvl: n for lvl, n in buckets.items() if lvl < current_price - min_gap}
-            if not far_enough:
-                return None
+        ask_clusters.sort(key=lambda x: x[0])    # nearest resistance wall first
+        bid_clusters.sort(key=lambda x: -x[0])   # nearest support wall first
 
-            significant = {lvl: n for lvl, n in far_enough.items() if n >= threshold}
-            pool = significant if significant else far_enough  # fall back rather than return nothing
-            if direction == "above":
-                lvl = min(pool.keys())
-            else:
-                lvl = max(pool.keys())
-            return (lvl, pool[lvl])
-
-        ask_buckets = build_buckets(asks)
-        bid_buckets = build_buckets(bids)
-
-        sell_wall = nearest_significant(ask_buckets, "above")
-        buy_wall  = nearest_significant(bid_buckets, "below")
-        return buy_wall, sell_wall
+        return bid_clusters, ask_clusters
     except Exception as e:
-        print(f"Liquidity wall error {symbol}: {e}")
-        return None, None
+        print(f"Order book error {symbol}: {e}")
+        return [], []
 
-
-# ============================================================================
-# Indicators
-# ============================================================================
 
 def calc_ema_series(closes, period):
     k = 2 / (period + 1)
@@ -309,137 +232,6 @@ def calc_sma(values, period):
     if len(values) < period:
         return sum(values) / len(values)
     return sum(values[-period:]) / period
-
-
-def calc_rsi(closes, period=RSI_PERIOD):
-    """Wilder's RSI. Returns None if there isn't enough history yet."""
-    if len(closes) < period + 1:
-        return None
-
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    for i in range(period + 1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gain = max(diff, 0)
-        loss = max(-diff, 0)
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
-
-
-def rsi_label(rsi):
-    if rsi is None:
-        return "—"
-    if rsi < 30:
-        return f"<code>{rsi}</code> (Oversold)"
-    if rsi > 70:
-        return f"<code>{rsi}</code> (Overbought)"
-    return f"<code>{rsi}</code> (Neutral)"
-
-
-def ema_arrow(series, lookback=3):
-    """▲/▼ based on whether the EMA is higher or lower than `lookback` candles ago."""
-    if not series or len(series) <= lookback:
-        return ""
-    return "▲" if series[-1] > series[-1 - lookback] else "▼"
-
-
-def momentum_label(ef, es, rsi):
-    """Heuristic composite of EMA-gap size + RSI distance from neutral 50."""
-    if ef is None or es is None or not es:
-        return "Weak"
-    gap_pct = abs(ef - es) / es * 100
-    rsi_dev = abs((rsi if rsi is not None else 50) - 50)
-    score = gap_pct * 8 + rsi_dev * 0.6
-    if score >= 12:
-        return "Strong"
-    if score >= 5:
-        return "Moderate"
-    return "Weak"
-
-
-def oi_trend_label(oi_change):
-    if oi_change is None:
-        return "—"
-    if oi_change > 1:
-        return "Increasing"
-    if oi_change < -1:
-        return "Decreasing"
-    return "Flat"
-
-
-def crowd_label(funding, oi_change):
-    if funding is None:
-        return ""
-    rising = oi_change is None or oi_change >= 0
-    if funding > 0.02 and rising:
-        return "Crowded Long"
-    if funding < -0.02 and rising:
-        return "Crowded Short"
-    return "Balanced"
-
-
-def volume_status(c_vol, vol_avg):
-    """Returns (pct_of_avg, status_label)."""
-    if not vol_avg:
-        return None, "—"
-    pct = round(c_vol / vol_avg * 100)
-    if pct >= 130:
-        return pct, "High Volume"
-    if pct <= 70:
-        return pct, "Low Volume"
-    return pct, "Above Average" if pct >= 100 else "Below Average"
-
-
-def dot(score):
-    """Generic 0-100 bullish-scale score -> 🟢/🟡/🔴."""
-    if score is None:
-        return "⚪"
-    if score >= 60:
-        return "🟢"
-    if score <= 40:
-        return "🔴"
-    return "🟡"
-
-
-def momentum_dot(mom_label, bull_trend, bear_trend):
-    if mom_label == "Strong":
-        return "🟢" if bull_trend else ("🔴" if bear_trend else "🟡")
-    if mom_label == "Weak":
-        return "🔴"
-    return "🟡"
-
-
-def volume_dot(status):
-    if status == "High Volume":
-        return "🟢"
-    if status == "Low Volume":
-        return "🔴"
-    return "🟡"
-
-
-def overall_bias_label(score):
-    if score >= 70:
-        return "Strongly bullish"
-    if score >= 55:
-        return "Bullish but waiting for confirmation"
-    if score >= 45:
-        return "Neutral / ranging"
-    if score >= 30:
-        return "Bearish but waiting for confirmation"
-    return "Strongly bearish"
-
 
 
 def calc_support_resistance(candles, current_price, lookback=SR_LOOKBACK,
@@ -487,19 +279,7 @@ def calc_support_resistance(candles, current_price, lookback=SR_LOOKBACK,
     return support, resistance
 
 
-# ============================================================================
-# Signal engine — LONG and SHORT
-# ============================================================================
-
 def check_signal(candles):
-    """
-    Returns {"type": "LONG"|"SHORT", "entry":.., "sl":.., "tp":..} or None.
-    LONG and SHORT use mirrored logic:
-      LONG:  bullish EMA trend, pullback INTO EMA support, bullish rejection
-             candle closing near its high, confirmed by volume + body size.
-      SHORT: bearish EMA trend, pullback INTO EMA resistance, bearish rejection
-             candle closing near its low, confirmed by volume + body size.
-    """
     if len(candles) < EMA_SLOW + 5:
         return None
 
@@ -524,475 +304,131 @@ def check_signal(candles):
     candle_range = c_high - c_low
     body_ratio   = body / candle_range if candle_range > 0 else 0
 
-    vol_ok  = c_vol > vol_avg
-    body_ok = body_ratio >= 0.6
-
-    atr_vals = [candles[i]["high"] - candles[i]["low"] for i in range(-15, -1)]
-    atr = sum(atr_vals) / len(atr_vals)
-
-    # --- LONG ---
     bull_trend    = ef > es
+    vol_ok        = c_vol > vol_avg
+    body_ok       = body_ratio >= 0.6
     long_close_ok = candle_range > 0 and (c_high - c_close) / candle_range <= 0.35
     long_pullback = bull_trend and (p_low <= ef1 or (p_low <= es1 and p_high >= ef1))
     long_cond     = (bull_trend and long_pullback and c_close > ef
                      and c_close > c_open and vol_ok and body_ok and long_close_ok)
 
-    # --- SHORT (mirror of LONG) ---
-    bear_trend     = ef < es
-    short_close_ok = candle_range > 0 and (c_close - c_low) / candle_range <= 0.35
-    short_pullback = bear_trend and (p_high >= ef1 or (p_high >= es1 and p_low <= ef1))
-    short_cond      = (bear_trend and short_pullback and c_close < ef
-                       and c_close < c_open and vol_ok and body_ok and short_close_ok)
+    atr_vals = [candles[i]["high"] - candles[i]["low"] for i in range(-15, -1)]
+    atr = sum(atr_vals) / len(atr_vals)
 
     if long_cond:
         sl = c_close - atr * 1.5
         tp = c_close + (c_close - sl) * 3.0
-        return {"type": "LONG", "entry": round(c_close, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
-
-    if short_cond:
-        sl = c_close + atr * 1.5
-        tp = c_close - (sl - c_close) * 3.0
-        return {"type": "SHORT", "entry": round(c_close, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
-
+        return {
+            "entry": round(c_close, 2),
+            "sl":    round(sl, 2),
+            "tp":    round(tp, 2),
+        }
     return None
 
 
-# ============================================================================
-# Confidence / Risk / Reasoning
-# ============================================================================
-# Every score_* function returns 0-100 "bullishness". For a SHORT-favored
-# read, calc_confidence() inverts (100 - score) so one set of functions
-# serves both directions consistently.
-
-def score_trend(ef, es):
-    if ef is None or es is None or not isinstance(ef, (int, float)) or es == 0:
-        return 50
-    gap_pct = (ef - es) / es * 100
-    return max(0, min(100, 50 + gap_pct * 8))
-
-
-def score_rsi(rsi):
-    if rsi is None:
-        return 50
-    if rsi <= 30:
-        return 80
-    if rsi >= 70:
-        return 20
-    return max(0, min(100, 80 - (rsi - 30) * 1.5))
-
-
-def score_volume(c_vol, vol_avg):
-    if not vol_avg:
-        return 50
-    ratio = c_vol / vol_avg
-    if ratio >= 1.5:
-        return 80
-    if ratio <= 0.7:
-        return 30
-    return 50 + (ratio - 1) * 40
-
-
-def score_funding(funding):
-    if funding is None:
-        return 50
-    if funding > 0.03:
-        return 30   # longs overheated -> contrarian bearish tilt
-    if funding < -0.03:
-        return 70   # shorts overheated -> contrarian bullish tilt
-    return 50
-
-
-def score_oi(oi_change):
-    if oi_change is None:
-        return 50
-    if oi_change > 3:
-        return 65
-    if oi_change < -3:
-        return 35
-    return 50
-
-
-def score_liquidity(price, sell_wall, buy_wall):
-    if not sell_wall and not buy_wall:
-        return 50
-    ask_dist = (sell_wall[0] - price) / price * 100 if sell_wall else 999
-    bid_dist = (price - buy_wall[0]) / price * 100 if buy_wall else 999
-    if ask_dist < bid_dist:
-        return 35   # resistance wall closer -> bearish tilt
-    if bid_dist < ask_dist:
-        return 65   # support wall closer -> bullish tilt
-    return 50
-
-
-def score_whale(tt_long, taker_buy):
-    if tt_long is None or taker_buy is None:
-        return 50
-    return (tt_long + taker_buy) / 2
-
-
-def score_sr(price, support, resistance):
-    if not support and not resistance:
-        return 50
-    r_dist = (resistance[0][0] - price) / price * 100 if resistance else 999
-    s_dist = (price - support[0][0]) / price * 100 if support else 999
-    if r_dist < s_dist:
-        return 35
-    if s_dist < r_dist:
-        return 65
-    return 50
-
-
-def calc_bullish_score(scores):
-    """Direction-agnostic 0-100 'how bullish is the market overall' score —
-    used both as the Market Score and as the base for calc_confidence()."""
-    weight_sum = sum(CONF_WEIGHTS.values())
-    return sum(scores[k] * CONF_WEIGHTS[k] for k in CONF_WEIGHTS) / weight_sum
-
-
-def calc_confidence(scores, direction):
-    """scores: dict matching CONF_WEIGHTS keys, each 0-100 bullishness.
-    Normalizes by the *actual* weight sum (see CONF_WEIGHTS comment)."""
-    bullish_total = calc_bullish_score(scores)
-    return round(bullish_total if direction == "LONG" else 100 - bullish_total)
-
-
-CONF_LABELS = {
-    "trend": "Trend", "rsi": "RSI", "volume": "Vol", "funding": "Fund",
-    "oi": "OI", "liquidity": "Liq", "whale": "Whale", "sr": "S/R",
-}
-
-
-def confidence_breakdown(scores, direction, top_n=3):
-    """Signed point contribution of each factor toward the confidence score,
-    e.g. 'Trend+25 RSI+7 Fund-3'. Contributions sum exactly to (confidence-50)."""
-    weight_sum = sum(CONF_WEIGHTS.values())
-    contribs = {}
-    for k in CONF_WEIGHTS:
-        raw = (scores[k] - 50) * CONF_WEIGHTS[k] / weight_sum
-        contribs[k] = raw if direction == "LONG" else -raw
-
-    ranked = sorted(contribs.items(), key=lambda x: -abs(x[1]))
-    parts = []
-    for k, v in ranked[:top_n]:
-        if abs(v) < 0.5:
-            continue
-        sign = "+" if v >= 0 else ""
-        parts.append(f"{CONF_LABELS[k]}{sign}{round(v)}")
-    return " ".join(parts)
-
-
-def calc_risk_level(funding, oi_change, rsi, trend_clear, whale_skew):
-    points = 0
-    if funding is not None and abs(funding) > 0.05:
-        points += 1
-    if oi_change is not None and abs(oi_change) > 5:
-        points += 1
-    if rsi is not None and (rsi > 75 or rsi < 25):
-        points += 1
-    if not trend_clear:
-        points += 1
-    if whale_skew is not None and abs(whale_skew) < 5:
-        points += 1
-
-    if points >= 3:
-        return "🔴 High"
-    if points >= 1:
-        return "🟡 Medium"
-    return "🟢 Low"
-
-
-def whale_interpretation(tt_long, taker_buy):
-    if tt_long is None or taker_buy is None:
-        return "Neutral ⚪"
-    bull, bear = 0, 0
-    if tt_long > 55:
-        bull += 1
-    elif tt_long < 45:
-        bear += 1
-    if taker_buy > 55:
-        bull += 1
-    elif taker_buy < 45:
-        bear += 1
-    if bull > bear:
-        return "Bullish 🟢"
-    if bear > bull:
-        return "Bearish 🔴"
-    return "Neutral ⚪"
-
-
-def build_wait_levels(bull_trend, bear_trend, ef, es, nearest_r, nearest_s):
-    """Actionable trigger levels for the WAIT recommendation."""
-    bull_entry = nearest_r[0] if nearest_r else ef
-    bear_entry = nearest_s[0] if nearest_s else es
-    invalidation = es if (bull_trend or bear_trend) else ef
-    return bull_entry, bear_entry, invalidation
-
-
-def build_wait_reasons(bull_trend, bear_trend, near_resistance, near_support, funding):
-    reasons = []
-    reasons.append("Trend bullish" if bull_trend else "Trend bearish" if bear_trend else "Trend unclear")
-    if near_resistance:
-        reasons.append("Resistance overhead")
-    if near_support:
-        reasons.append("Support below — watching for reaction")
-    if funding is not None and abs(funding) > 0.02:
-        payer = "Longs" if funding > 0 else "Shorts"
-        reasons.append(f"{payer} paying elevated funding")
-    reasons.append("Waiting for confirmed breakout")
-    return reasons[:4]
-
-
-def build_signal_reasons(sig_type, vol_ok, body_ok):
-    reasons = []
-    if sig_type == "LONG":
-        reasons.append("Bullish EMA trend (21 > 50)")
-        reasons.append("Pullback held at EMA support")
-    else:
-        reasons.append("Bearish EMA trend (21 < 50)")
-        reasons.append("Pullback rejected at EMA resistance")
-    if vol_ok:
-        reasons.append("Volume confirms the move")
-    if body_ok:
-        reasons.append("Strong-bodied confirmation candle")
-    return reasons
-
-
-# ============================================================================
-# Message parsing
-# ============================================================================
-
-def parse_message(text):
-    """'BTC' -> (BTCUSDT, '1H', '1h'); 'ETH 4H' -> (ETHUSDT, '4H', '4h')."""
-    parts = (text or "").strip().upper().split()
-    if not parts or parts[0] not in VALID_COINS:
-        return None, None, None
-
-    symbol = VALID_COINS[parts[0]]
-    tf_label = DEFAULT_TF_LABEL
-    if len(parts) >= 2 and parts[1] in TIMEFRAME_ALIASES:
-        tf_label = parts[1]
-    return symbol, tf_label, TIMEFRAME_ALIASES[tf_label]
-
-
-# ============================================================================
-# Main analysis builder
-# ============================================================================
-
-def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
-    coin = symbol.replace("USDT", "")
-
-    # Independent API calls run concurrently to cut total latency.
-    with ThreadPoolExecutor(max_workers=7) as ex:
-        f_ticker  = ex.submit(fetch_price_ticker, symbol)
-        f_candles = ex.submit(fetch_candles, symbol, tf_binance, CANDLE_LIMIT)
-        f_oi      = ex.submit(fetch_oi, symbol)
-        f_oichg   = ex.submit(fetch_oi_change, symbol, tf_binance)
-        f_funding = ex.submit(fetch_funding, symbol)
-        f_taker   = ex.submit(fetch_taker_volume, symbol)
-        f_tt      = ex.submit(fetch_top_trader, symbol)
-
-        ticker    = f_ticker.result()
-        candles   = f_candles.result()
-        oi        = f_oi.result()
-        oi_change = f_oichg.result()
-        funding   = f_funding.result()
-        buy_pct, sell_pct = f_taker.result()
-        tt_long, tt_short = f_tt.result()
+def get_full_analysis(symbol):
+    coin    = symbol.replace("USDT", "")
+    ticker  = fetch_price_ticker(symbol)
+    candles = fetch_daily_candles(symbol, limit=60)
+    oi                          = fetch_oi(symbol)
+    funding                     = fetch_funding(symbol)
+    buy_pct, sell_pct           = fetch_taker_volume(symbol)
+    ls_ratio, ls_long, ls_short = fetch_ls_ratio(symbol)
+    tt_long, tt_short           = fetch_top_trader(symbol)
+    sig                         = check_signal(candles) if candles else None
 
     price  = ticker.get("price", 0)
     change = ticker.get("change", 0)
 
-    # Liquidity walls + S/R both need `price`; walls are still a network call
-    # so they run concurrently with the (local, non-network) S/R calc.
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        f_liq = ex.submit(fetch_liquidity_walls, symbol, price)
-        support, resistance = calc_support_resistance(candles, price) if candles else ([], [])
-        buy_wall, sell_wall = f_liq.result()
-
-    sig = check_signal(candles) if candles else None
-
-    closes  = [c["close"]  for c in candles] if candles else []
-    volumes = [c["volume"] for c in candles] if candles else []
-
-    ema21_series = calc_ema_series(closes, EMA_FAST) if len(closes) >= EMA_FAST else []
-    ema50_series = calc_ema_series(closes, EMA_SLOW) if len(closes) >= EMA_SLOW else []
-    ef  = round(ema21_series[-1], 2) if ema21_series else None
-    es  = round(ema50_series[-1], 2) if ema50_series else None
-    rsi = calc_rsi(closes)
-
-    bull_trend = isinstance(ef, float) and isinstance(es, float) and ef > es
-    bear_trend = isinstance(ef, float) and isinstance(es, float) and ef < es
-    cross_label = "Bullish" if bull_trend else ("Bearish" if bear_trend else "Flat")
-
-    vol_avg = calc_sma(volumes[:-1], VOL_SMA) if len(volumes) > VOL_SMA else 0
-    c_vol   = volumes[-2] if len(volumes) >= 2 else 0
-    vol_ok  = c_vol > vol_avg if vol_avg else False
-    vol_pct, vol_status_label = volume_status(c_vol, vol_avg)
-
-    nearest_r = resistance[0] if resistance else None
-    nearest_s = support[0] if support else None
-    r_dist = (nearest_r[0] - price) / price * 100 if (nearest_r and price) else None
-    s_dist = (price - nearest_s[0]) / price * 100 if (nearest_s and price) else None
-    near_resistance = r_dist is not None and r_dist < 1.5
-    near_support    = s_dist is not None and s_dist < 1.5
-
-    whale_skew = (tt_long - 50) if tt_long is not None else None
-    momentum   = momentum_label(ef, es, rsi)
-
-    # ---- Scoring: Confidence, Market Score, Risk ----
-    scores = {
-        "trend":     score_trend(ef, es),
-        "rsi":       score_rsi(rsi),
-        "volume":    score_volume(c_vol, vol_avg),
-        "funding":   score_funding(funding),
-        "oi":        score_oi(oi_change),
-        "liquidity": score_liquidity(price, sell_wall, buy_wall),
-        "whale":     score_whale(tt_long, buy_pct),
-        "sr":        score_sr(price, support, resistance),
-    }
-    bullish_score = calc_bullish_score(scores)   # 0-100, direction-agnostic
-    direction     = sig["type"] if sig else ("LONG" if bull_trend else "SHORT")
-    confidence    = calc_confidence(scores, direction)
-    conf_why      = confidence_breakdown(scores, direction)
-    risk_level    = calc_risk_level(funding, oi_change, rsi, bull_trend or bear_trend, whale_skew)
-
-    # ---- Display formatting ----
+    support, resistance     = calc_support_resistance(candles, price) if candles else ([], [])
+    bid_clusters, ask_clusters = fetch_order_book_clusters(symbol, price)
     ch_icon = "▲" if change >= 0 else "▼"
     ch_sign = "+" if change >= 0 else ""
-    ef_disp = ef if ef is not None else "—"
-    es_disp = es if es is not None else "—"
-    ef_arr  = ema_arrow(ema21_series)
-    es_arr  = ema_arrow(ema50_series)
 
-    r_disp = f"<code>${nearest_r[0]:,.2f}</code> +{r_dist:.2f}%" if nearest_r else "—"
-    s_disp = f"<code>${nearest_s[0]:,.2f}</code> -{s_dist:.2f}%" if nearest_s else "—"
+    closes = [c["close"] for c in candles] if candles else []
+    ef = round(calc_ema_series(closes, EMA_FAST)[-1], 2) if len(closes) >= EMA_FAST else "—"
+    es = round(calc_ema_series(closes, EMA_SLOW)[-1], 2) if len(closes) >= EMA_SLOW else "—"
+    bias = "Bullish ✅" if (isinstance(ef, float) and isinstance(es, float) and ef > es) else "Bearish ❌"
 
-    oi_disp     = f"<code>{oi}B</code>" if oi else "—"
-    oi_chg_sign = "+" if oi_change is not None and oi_change >= 0 else ""
-    oi_line     = f"OI {oi_disp}"
-    if oi_change is not None:
-        oi_line += f" <code>{oi_chg_sign}{oi_change}%</code>  {oi_trend_label(oi_change)}"
-
-    f_sign  = "+" if funding is not None and funding >= 0 else ""
-    f_pay   = "Longs pay" if funding is not None and funding >= 0 else "Shorts pay"
-    f_crowd = crowd_label(funding, oi_change)
-    funding_line = (f"Funding <code>{f_sign}{funding}%</code> {f_pay} · {f_crowd}"
-                     if funding is not None else "Funding —")
-
-    if sell_wall:
-        sw_lvl, sw_val = sell_wall
-        sw_dist = (sw_lvl - price) / price * 100 if price else 0
-        sell_line = f"Sell Wall <code>${sw_lvl:,.2f}</code> +{sw_dist:.2f}% (${sw_val/1e6:.1f}M)"
-    else:
-        sell_line = "Sell Wall —"
-    if buy_wall:
-        bw_lvl, bw_val = buy_wall
-        bw_dist = (price - bw_lvl) / price * 100 if price else 0
-        buy_line = f"Buy Wall  <code>${bw_lvl:,.2f}</code> -{bw_dist:.2f}% (${bw_val/1e6:.1f}M)"
-    else:
-        buy_line = "Buy Wall  —"
-
-    whale_read = whale_interpretation(tt_long, buy_pct)
-    tt_disp    = f"{tt_long}%" if tt_long is not None else "—"
-    buy_disp   = f"{buy_pct}%" if buy_pct is not None else "—"
-    whale_line = f"Top <code>{tt_disp}</code> Long · Taker <code>{buy_disp}</code> Buy → {whale_read}"
-
-    vol_disp = f"<code>{vol_pct}%</code> avg — {vol_status_label}" if vol_pct is not None else "—"
-
-    market_dots = (
-        f"Trend{dot(scores['trend'])} Mom{momentum_dot(momentum, bull_trend, bear_trend)} "
-        f"Liq{dot(scores['liquidity'])} Fund{dot(scores['funding'])} "
-        f"Whale{dot(scores['whale'])} Vol{volume_dot(vol_status_label)}"
-    )
-    overall_score = round(bullish_score)
-    signal_tag    = "  (Signal Active)" if sig else ""
-    overall_line  = f"Overall <code>{overall_score}/100</code> — {overall_bias_label(overall_score)}{signal_tag} · Risk {risk_level}"
-
-    conf_disp = f"Confidence <code>{confidence}%</code>" + (f"  ({conf_why})" if conf_why else "")
+    oi_line      = f"<code>{oi}B</code>" if oi else "—"
+    f_sign       = "+" if funding and funding >= 0 else ""
+    f_pay        = "Longs pay" if funding and funding >= 0 else "Shorts pay"
+    funding_line = f"<code>{f_sign}{funding}%</code>  ({f_pay})" if funding is not None else "—"
+    taker_line   = f"Buy <code>{buy_pct}%</code>  Sell <code>{sell_pct}%</code>" if buy_pct else "—"
+    ls_line      = f"<code>{ls_ratio}</code>  (Long <code>{ls_long}%</code> · Short <code>{ls_short}%</code>)" if ls_ratio else "—"
+    tt_line      = f"Long <code>{tt_long}%</code>  Short <code>{tt_short}%</code>" if tt_long else "—"
 
     if sig:
-        emoji = "🎯" if sig["type"] == "LONG" else "🔻"
-        reasons = build_signal_reasons(sig["type"], vol_ok, True)
-        risk_reward = abs(sig["tp"] - sig["entry"]) / abs(sig["entry"] - sig["sl"]) if sig["entry"] != sig["sl"] else 0
-        rec_block = (
-            f"{emoji} <b>Recommendation: {sig['type']}</b>\n"
-            f"{conf_disp}\n"
-            f"Entry <code>{sig['entry']}</code>  SL <code>{sig['sl']}</code>  TP <code>{sig['tp']}</code>\n"
-            f"Risk:Reward <code>1:{risk_reward:.1f}</code>\n"
-            f"Reason: {' · '.join(reasons)}"
+        signal_line = (
+            f"🎯 <b>LONG Setup Active</b>\n"
+            f"Entry: <code>{sig['entry']}</code>\n"
+            f"SL:      <code>{sig['sl']}</code>\n"
+            f"TP:      <code>{sig['tp']}</code>"
         )
     else:
-        bull_entry, bear_entry, invalidation = build_wait_levels(bull_trend, bear_trend, ef, es, nearest_r, nearest_s)
-        reasons = build_wait_reasons(bull_trend, bear_trend, near_resistance, near_support, funding)
-        be_disp = f"<code>${bull_entry:,.2f}</code>" if bull_entry else "—"
-        se_disp = f"<code>${bear_entry:,.2f}</code>" if bear_entry else "—"
-        inv_disp = f"<code>${invalidation:,.2f}</code>" if invalidation else "—"
-        rec_block = (
-            f"⏳ <b>Recommendation: WAIT</b>\n"
-            f"{conf_disp}\n"
-            f"Bull Entry Above {be_disp}   Bear Entry Below {se_disp}\n"
-            f"Invalidation {inv_disp}\n"
-            f"Reason: {' · '.join(reasons)}"
-        )
+        signal_line = "⏳ No signal — waiting for setup"
+
+    r_parts = [f"R{i}: <code>${lvl:,.2f}</code> ({t}x)" for i, (lvl, t) in enumerate(resistance, 1)]
+    s_parts = [f"S{i}: <code>${lvl:,.2f}</code> ({t}x)" for i, (lvl, t) in enumerate(support, 1)]
+    r_line  = "   ".join(r_parts) if r_parts else "—"
+    s_line  = "   ".join(s_parts) if s_parts else "—"
+
+    ask_parts = [f"Ask{i}: <code>${lvl:,.2f}</code> (${v/1e6:.1f}M)" for i, (lvl, v) in enumerate(ask_clusters, 1)]
+    bid_parts = [f"Bid{i}: <code>${lvl:,.2f}</code> (${v/1e6:.1f}M)" for i, (lvl, v) in enumerate(bid_clusters, 1)]
+    ask_line  = "   ".join(ask_parts) if ask_parts else "—"
+    bid_line  = "   ".join(bid_parts) if bid_parts else "—"
 
     return (
-        f"📊 <b>{coin}/USDT</b> ⏰ <b>{tf_label}</b>   <code>${price:,.2f}</code>  {ch_icon}{ch_sign}{change}%\n"
+        f"📊 <b>{coin}/USDT Analysis</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Price:   <code>${price:,.2f}</code>  {ch_icon} {ch_sign}{change}%\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 <b>Trend</b>\n"
-        f"EMA21{ef_arr} <code>{ef_disp}</code>  EMA50{es_arr} <code>{es_disp}</code>\n"
-        f"Cross {cross_label} · RSI {rsi_label(rsi)} · Momentum {momentum}\n"
-        f"Resistance {r_disp}   Support {s_disp}\n"
+        f"EMA 21:  <code>{ef}</code>\n"
+        f"EMA 50:  <code>{es}</code>\n"
+        f"Bias:      {bias}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Futures</b>\n"
-        f"{oi_line}\n"
-        f"{funding_line}\n"
+        f"📐 <b>Support/Resistance</b>\n"
+        f"{r_line}\n"
+        f"{s_line}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💧 <b>Liquidity</b>\n"
-        f"{sell_line}\n"
-        f"{buy_line}\n"
+        f"📊 <b>Futures Data</b>\n"
+        f"OI:          {oi_line}\n"
+        f"Funding:  {funding_line}\n"
+        f"L/S:          {ls_line}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🐋 <b>Whales</b>\n"
-        f"{whale_line}\n"
+        f"💧 <b>Liquidity Clusters</b> <i>(order book)</i>\n"
+        f"{ask_line}\n"
+        f"{bid_line}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"📦 Volume {vol_disp}\n"
+        f"🐋 <b>Whale Activity</b>\n"
+        f"Taker:       {taker_line}\n"
+        f"Top Trader: {tt_line}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>Market Score</b>\n"
-        f"{market_dots}\n"
-        f"{overall_line}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"{rec_block}"
+        f"{signal_line}"
     )
 
 
-# ============================================================================
-# Telegram handlers
-# ============================================================================
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol, tf_label, tf_binance = parse_message(update.message.text)
-    if symbol:
+    text = update.message.text.strip().upper()
+    if text in VALID_COINS:
+        symbol = VALID_COINS[text]
         await update.message.reply_text("⏳ Fetching data...")
         try:
             loop = asyncio.get_running_loop()
-            msg = await loop.run_in_executor(None, get_full_analysis, symbol, tf_label, tf_binance)
+            msg = await loop.run_in_executor(None, get_full_analysis, symbol)
             await update.message.reply_text(msg, parse_mode="HTML")
         except Exception as e:
             print(f"handle_message error: {e}")
             await update.message.reply_text("❌ Error fetching data. Try again.")
     else:
         await update.message.reply_text(
-            "Send a coin (optionally with timeframe):\n"
-            "<b>BTC · ETH · SOL · LINK</b>\n"
-            "e.g. <code>BTC</code>, <code>BTC 1H</code>, <code>ETH 4H</code>, <code>SOL 15M</code>\n"
-            "Timeframes: 15M · 30M · 1H · 4H · 1D (default 1H)",
+            "Send a coin name:\n<b>BTC · ETH · SOL · LINK</b>",
             parse_mode="HTML"
         )
 
 
 def auto_signal_loop():
-    """Background loop on AUTO_SIGNAL_TF (Daily by default). Now fires both
-    LONG and SHORT alerts, and re-arms whenever the signal direction flips
-    or clears, same debounce pattern as before."""
     armed         = {coin: True for coin in COINS}
     last_sig_type = {coin: None for coin in COINS}
 
@@ -1002,20 +438,19 @@ def auto_signal_loop():
             print(f"[{now.strftime('%H:%M UTC')}] Auto signal check...")
             for symbol in COINS:
                 try:
-                    candles = fetch_candles(symbol, AUTO_SIGNAL_TF, limit=CANDLE_LIMIT)
+                    candles = fetch_daily_candles(symbol, limit=60)
                     if not candles:
                         continue
                     sig = check_signal(candles)
                     if sig:
-                        if armed[symbol] and last_sig_type[symbol] != sig["type"]:
+                        if armed[symbol] and last_sig_type[symbol] != "LONG":
                             oi      = fetch_oi(symbol)
                             funding = fetch_funding(symbol)
                             coin    = symbol.replace("USDT", "")
-                            f_sign  = "+" if funding is not None and funding >= 0 else ""
-                            f_pay   = "Longs pay" if funding is not None and funding >= 0 else "Shorts pay"
-                            emoji   = "🟢" if sig["type"] == "LONG" else "🔴"
+                            f_sign  = "+" if funding and funding >= 0 else ""
+                            f_pay   = "Longs pay" if funding and funding >= 0 else "Shorts pay"
                             msg = (
-                                f"{emoji} <b>{sig['type']} SIGNAL</b>\n"
+                                f"🟢 <b>LONG SIGNAL</b>\n"
                                 f"<b>{coin}/USDT</b> · Daily\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"Entry:  <code>{sig['entry']}</code>\n"
@@ -1028,9 +463,9 @@ def auto_signal_loop():
                                 f"<i>EMA Swing 21/50 · RR 1:3</i>"
                             )
                             send_telegram(msg)
-                            print(f"Signal sent: {symbol} {sig['type']}")
+                            print(f"Signal sent: {symbol} LONG")
                             armed[symbol]         = False
-                            last_sig_type[symbol] = sig["type"]
+                            last_sig_type[symbol] = "LONG"
                     else:
                         armed[symbol] = True
                 except Exception as e:
@@ -1047,8 +482,7 @@ def main():
         "✅ <b>Signal Bot চালু হয়েছে</b>\n"
         "BTC · ETH · SOL · LINK monitoring\n\n"
         "যেকোনো সময় লিখো:\n"
-        "<b>BTC</b> বা <b>ETH</b> বা <b>SOL</b> বা <b>LINK</b>\n"
-        "(টাইমফ্রেম যোগ করতে পারো: <b>BTC 1H</b>, <b>ETH 4H</b>)"
+        "<b>BTC</b> বা <b>ETH</b> বা <b>SOL</b> বা <b>LINK</b>"
     )
 
     auto_signal_loop()
