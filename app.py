@@ -26,6 +26,14 @@ COINGECKO_IDS = {
     "LTC": "litecoin"
 }
 
+SR_LOOKBACK    = 5      # candles each side to confirm a swing high/low
+SR_TOLERANCE   = 0.015  # cluster swing points within 1.5% as one level
+SR_LEVELS      = 2      # how many S/R levels to show each side
+
+LIQ_BUCKET_PCT = 0.002  # 0.2% price bucket width for order book clustering
+LIQ_CLUSTERS   = 2      # how many liquidity walls to show each side
+LIQ_DEPTH      = 200    # order book depth to fetch from Bybit
+
 
 def cg_headers():
     return {
@@ -81,6 +89,119 @@ def fetch_prices():
     return {}
 
 
+def fetch_ohlc_coingecko(gecko_id, days=30):
+    try:
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{gecko_id}/ohlc",
+            params={"vs_currency": "usd", "days": days},
+            timeout=15
+        )
+        data = r.json()
+        if not isinstance(data, list):
+            print(f"CoinGecko OHLC error {gecko_id}: {data}")
+            return []
+        candles = []
+        for row in data:
+            # row = [timestamp_ms, open, high, low, close]
+            candles.append({
+                "open":  float(row[1]),
+                "high":  float(row[2]),
+                "low":   float(row[3]),
+                "close": float(row[4]),
+            })
+        return candles
+    except Exception as e:
+        print(f"CoinGecko OHLC error {gecko_id}: {e}")
+        return []
+
+
+def calc_support_resistance(candles, current_price, lookback=SR_LOOKBACK,
+                             tolerance=SR_TOLERANCE, num_levels=SR_LEVELS):
+    if not current_price or len(candles) < lookback * 2 + 3:
+        return [], []
+
+    scan = candles[:-1]  # exclude current/incomplete candle
+    highs = [c["high"] for c in scan]
+    lows  = [c["low"]  for c in scan]
+    n = len(scan)
+
+    swing_highs, swing_lows = [], []
+    for i in range(lookback, n - lookback):
+        window_h = highs[i - lookback:i + lookback + 1]
+        window_l = lows[i - lookback:i + lookback + 1]
+        if highs[i] == max(window_h):
+            swing_highs.append(highs[i])
+        if lows[i] == min(window_l):
+            swing_lows.append(lows[i])
+
+    def cluster(levels):
+        if not levels:
+            return []
+        levels = sorted(levels)
+        clusters, bucket = [], [levels[0]]
+        for lvl in levels[1:]:
+            if lvl <= bucket[-1] * (1 + tolerance):
+                bucket.append(lvl)
+            else:
+                clusters.append(bucket)
+                bucket = [lvl]
+        clusters.append(bucket)
+        return [(sum(c) / len(c), len(c)) for c in clusters]
+
+    resistance = [c for c in cluster(swing_highs) if c[0] > current_price]
+    support    = [c for c in cluster(swing_lows)  if c[0] < current_price]
+
+    resistance.sort(key=lambda x: -x[1])  # strongest (most touches) first
+    support.sort(key=lambda x: -x[1])
+
+    resistance = sorted(resistance[:num_levels], key=lambda x: x[0])   # nearest first
+    support    = sorted(support[:num_levels],    key=lambda x: -x[0])  # nearest first
+
+    return support, resistance
+
+
+def fetch_bybit_liquidity_clusters(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT,
+                                    num_clusters=LIQ_CLUSTERS, depth_limit=LIQ_DEPTH):
+    if not current_price:
+        return [], []
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/orderbook",
+            params={"category": "linear", "symbol": symbol, "limit": depth_limit},
+            timeout=10
+        )
+        data = r.json()
+        result = data.get("result", {})
+        bids = result.get("b", [])  # [[price, size], ...] descending
+        asks = result.get("a", [])  # [[price, size], ...] ascending
+
+        bucket_size = current_price * bucket_pct
+        if bucket_size <= 0:
+            return [], []
+
+        def cluster_side(orders):
+            buckets = {}
+            for p_str, q_str in orders:
+                p = float(p_str)
+                q = float(q_str)
+                notional = p * q
+                key = round(p / bucket_size) * bucket_size
+                buckets[key] = buckets.get(key, 0) + notional
+            ranked = sorted(buckets.items(), key=lambda x: -x[1])
+            return ranked[:num_clusters]
+
+        bid_clusters = cluster_side(bids)   # support-side liquidity (below price)
+        ask_clusters = cluster_side(asks)   # resistance-side liquidity (above price)
+
+        ask_clusters.sort(key=lambda x: x[0])    # nearest resistance wall first
+        bid_clusters.sort(key=lambda x: -x[0])   # nearest support wall first
+
+        return bid_clusters, ask_clusters
+    except Exception as e:
+        print(f"Bybit order book error {symbol}: {e}")
+        return [], []
+
+
 def fetch_liquidation_data():
     try:
         r = requests.get(
@@ -103,10 +224,12 @@ def fetch_liquidation_data():
     return {}
 
 
-def fetch_oi_data():
+def fetch_oi_data(coins=None):
+    if coins is None:
+        coins = COINS
     try:
         result = {}
-        for coin in COINS:
+        for coin in coins:
             r = requests.get(
                 f"{CG_BASE}/futures/open-interest/exchange-list",
                 headers=cg_headers(),
@@ -131,10 +254,12 @@ def fetch_oi_data():
     return {}
 
 
-def fetch_funding_data():
+def fetch_funding_data(coins=None):
+    if coins is None:
+        coins = COINS
     try:
         result = {}
-        for coin in COINS:
+        for coin in coins:
             r = requests.get(
                 f"{CG_BASE}/futures/funding-rate/exchange-list",
                 headers=cg_headers(),
@@ -202,6 +327,51 @@ def scan():
 
     out.sort(key=lambda x: abs(float(x["change"])), reverse=True)
     return jsonify({"coins": out, "status": "ok"})
+
+
+@app.route("/api/coin/<symbol>")
+def coin_detail(symbol):
+    symbol = symbol.upper()
+    if symbol not in COINS:
+        return jsonify({"error": "unsupported symbol", "supported": COINS}), 400
+
+    gecko_id = COINGECKO_IDS[symbol]
+    trading_symbol = symbol + "USDT"
+
+    prices = fetch_prices()
+    price_info = prices.get(symbol, {})
+    price = float(price_info.get("price", 0) or 0)
+
+    liq_data = fetch_liquidation_data()
+    liq = liq_data.get(symbol, {})
+
+    oi_data = fetch_oi_data([symbol])
+    oi = oi_data.get(symbol, {})
+
+    funding_data = fetch_funding_data([symbol])
+    funding = funding_data.get(symbol, "0")
+
+    candles = fetch_ohlc_coingecko(gecko_id, days=30)
+    support, resistance = calc_support_resistance(candles, price)
+
+    bid_clusters, ask_clusters = fetch_bybit_liquidity_clusters(trading_symbol, price)
+
+    return jsonify({
+        "symbol": trading_symbol,
+        "price": price_info.get("price", "0"),
+        "change": price_info.get("change", "0"),
+        "volume": price_info.get("volume", "0"),
+        "oi": oi.get("oi", "0"),
+        "oi_change": oi.get("oi_change", "0"),
+        "long_liq": liq.get("long_liq", "0"),
+        "short_liq": liq.get("short_liq", "0"),
+        "funding": funding,
+        "support": [{"price": round(p, 2), "touches": t} for p, t in support],
+        "resistance": [{"price": round(p, 2), "touches": t} for p, t in resistance],
+        "liquidity_bids": [{"price": round(p, 2), "notional_usd": round(v, 2)} for p, v in bid_clusters],
+        "liquidity_asks": [{"price": round(p, 2), "notional_usd": round(v, 2)} for p, v in ask_clusters],
+        "status": "ok"
+    })
 
 
 @app.route("/tv/<secret>", methods=["POST"])
