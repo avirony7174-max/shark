@@ -23,6 +23,14 @@ EMA_SLOW       = 50
 VOL_SMA        = 10
 CHECK_INTERVAL = 900
 
+SR_LOOKBACK    = 5      # candles each side to confirm a swing high/low
+SR_TOLERANCE   = 0.015  # cluster swing points within 1.5% as one level
+SR_LEVELS      = 2      # how many S/R levels to show each side
+
+LIQ_BUCKET_PCT = 0.002  # 0.2% price bucket width for order book clustering
+LIQ_CLUSTERS   = 2      # how many liquidity walls to show each side
+LIQ_DEPTH      = 500    # order book depth to fetch
+
 
 def send_telegram(message):
     try:
@@ -171,6 +179,47 @@ def fetch_top_trader(symbol):
     return None, None
 
 
+def fetch_order_book_clusters(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT,
+                               num_clusters=LIQ_CLUSTERS, depth_limit=LIQ_DEPTH):
+    if not current_price:
+        return [], []
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/depth",
+            params={"symbol": symbol, "limit": depth_limit},
+            timeout=10
+        )
+        data = r.json()
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+
+        bucket_size = current_price * bucket_pct
+        if bucket_size <= 0:
+            return [], []
+
+        def cluster_side(orders):
+            buckets = {}
+            for p_str, q_str in orders:
+                p = float(p_str)
+                q = float(q_str)
+                notional = p * q
+                key = round(p / bucket_size) * bucket_size
+                buckets[key] = buckets.get(key, 0) + notional
+            ranked = sorted(buckets.items(), key=lambda x: -x[1])
+            return ranked[:num_clusters]
+
+        bid_clusters = cluster_side(bids)   # support-side liquidity (below price)
+        ask_clusters = cluster_side(asks)   # resistance-side liquidity (above price)
+
+        ask_clusters.sort(key=lambda x: x[0])    # nearest resistance wall first
+        bid_clusters.sort(key=lambda x: -x[0])   # nearest support wall first
+
+        return bid_clusters, ask_clusters
+    except Exception as e:
+        print(f"Order book error {symbol}: {e}")
+        return [], []
+
+
 def calc_ema_series(closes, period):
     k = 2 / (period + 1)
     ema = [closes[0]]
@@ -183,6 +232,51 @@ def calc_sma(values, period):
     if len(values) < period:
         return sum(values) / len(values)
     return sum(values[-period:]) / period
+
+
+def calc_support_resistance(candles, current_price, lookback=SR_LOOKBACK,
+                             tolerance=SR_TOLERANCE, num_levels=SR_LEVELS):
+    if not current_price or len(candles) < lookback * 2 + 3:
+        return [], []
+
+    scan = candles[:-1]  # exclude current/incomplete candle
+    highs = [c["high"] for c in scan]
+    lows  = [c["low"]  for c in scan]
+    n = len(scan)
+
+    swing_highs, swing_lows = [], []
+    for i in range(lookback, n - lookback):
+        window_h = highs[i - lookback:i + lookback + 1]
+        window_l = lows[i - lookback:i + lookback + 1]
+        if highs[i] == max(window_h):
+            swing_highs.append(highs[i])
+        if lows[i] == min(window_l):
+            swing_lows.append(lows[i])
+
+    def cluster(levels):
+        if not levels:
+            return []
+        levels = sorted(levels)
+        clusters, bucket = [], [levels[0]]
+        for lvl in levels[1:]:
+            if lvl <= bucket[-1] * (1 + tolerance):
+                bucket.append(lvl)
+            else:
+                clusters.append(bucket)
+                bucket = [lvl]
+        clusters.append(bucket)
+        return [(sum(c) / len(c), len(c)) for c in clusters]
+
+    resistance = [c for c in cluster(swing_highs) if c[0] > current_price]
+    support    = [c for c in cluster(swing_lows)  if c[0] < current_price]
+
+    resistance.sort(key=lambda x: -x[1])  # strongest (most touches) first
+    support.sort(key=lambda x: -x[1])
+
+    resistance = sorted(resistance[:num_levels], key=lambda x: x[0])   # nearest first
+    support    = sorted(support[:num_levels],    key=lambda x: -x[0])  # nearest first
+
+    return support, resistance
 
 
 def check_signal(candles):
@@ -245,6 +339,9 @@ def get_full_analysis(symbol):
 
     price  = ticker.get("price", 0)
     change = ticker.get("change", 0)
+
+    support, resistance     = calc_support_resistance(candles, price) if candles else ([], [])
+    bid_clusters, ask_clusters = fetch_order_book_clusters(symbol, price)
     ch_icon = "▲" if change >= 0 else "▼"
     ch_sign = "+" if change >= 0 else ""
 
@@ -271,6 +368,16 @@ def get_full_analysis(symbol):
     else:
         signal_line = "⏳ No signal — waiting for setup"
 
+    r_parts = [f"R{i}: <code>${lvl:,.2f}</code> ({t}x)" for i, (lvl, t) in enumerate(resistance, 1)]
+    s_parts = [f"S{i}: <code>${lvl:,.2f}</code> ({t}x)" for i, (lvl, t) in enumerate(support, 1)]
+    r_line  = "   ".join(r_parts) if r_parts else "—"
+    s_line  = "   ".join(s_parts) if s_parts else "—"
+
+    ask_parts = [f"Ask{i}: <code>${lvl:,.2f}</code> (${v/1e6:.1f}M)" for i, (lvl, v) in enumerate(ask_clusters, 1)]
+    bid_parts = [f"Bid{i}: <code>${lvl:,.2f}</code> (${v/1e6:.1f}M)" for i, (lvl, v) in enumerate(bid_clusters, 1)]
+    ask_line  = "   ".join(ask_parts) if ask_parts else "—"
+    bid_line  = "   ".join(bid_parts) if bid_parts else "—"
+
     return (
         f"📊 <b>{coin}/USDT Analysis</b>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -281,10 +388,18 @@ def get_full_analysis(symbol):
         f"EMA 50:  <code>{es}</code>\n"
         f"Bias:      {bias}\n"
         f"━━━━━━━━━━━━━━━\n"
+        f"📐 <b>Support/Resistance</b>\n"
+        f"{r_line}\n"
+        f"{s_line}\n"
+        f"━━━━━━━━━━━━━━━\n"
         f"📊 <b>Futures Data</b>\n"
         f"OI:          {oi_line}\n"
         f"Funding:  {funding_line}\n"
         f"L/S:          {ls_line}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💧 <b>Liquidity Clusters</b> <i>(order book)</i>\n"
+        f"{ask_line}\n"
+        f"{bid_line}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🐋 <b>Whale Activity</b>\n"
         f"Taker:       {taker_line}\n"
