@@ -42,6 +42,7 @@ LIQ_BUCKET_PCT   = 0.002  # 0.2% price bucket width for order book clustering
 LIQ_DEPTH        = 500    # order book depth to fetch
 LIQ_MIN_GAP_MULT = 0.5    # buckets within 0.5 bucket-widths of price are "at market", not a wall
 LIQ_SIG_MULT     = 1.5    # a bucket must be >= 1.5x the median bucket size to count as "significant"
+LIQ_MAX_WALLS    = 3      # how many significant walls to surface per side
 
 # Confidence weights (section 10 of spec). NOTE: as given these summed to
 # 110%, not 100% (25+10+10+10+15+15+15+10). Rather than silently rescale the
@@ -216,24 +217,30 @@ def fetch_top_trader(symbol):
     return None, None
 
 
-def fetch_liquidity_walls(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT, depth_limit=LIQ_DEPTH,
-                           min_gap_mult=LIQ_MIN_GAP_MULT, sig_mult=LIQ_SIG_MULT):
-    """
-    Returns (buy_wall, sell_wall), each either (price, notional_usd) or None.
+LIQ_STRENGTH_BANDS = [
+    (6.0, "Extreme"),
+    (3.0, "Strong"),
+    (1.5, "Moderate"),
+]
+LIQ_STRENGTH_POINTS = {"Weak": 25, "Moderate": 50, "Strong": 75, "Extreme": 100}
 
-    Bug this replaces: the old version picked the single largest notional
-    bucket on each side, full stop. Real order books are always densest at
-    the touch (best bid/ask), so that bucket — sitting ~0% away from price —
-    almost always won, making the bot report a "wall" exactly at market
-    price. Fixed by (1) excluding any bucket within half a bucket-width of
-    price (the "at market" zone isn't a wall, it's just the spread), then
-    (2) requiring a bucket's notional to be at least `sig_mult`x the median
-    bucket size on that side to count as "significant", then (3) picking the
-    NEAREST bucket that clears that bar — not the biggest one overall, which
-    could be far away and less actionable.
-    """
+
+def classify_wall_strength(notional, median_notional):
+    if median_notional <= 0:
+        return "Weak"
+    ratio = notional / median_notional
+    for threshold, label in LIQ_STRENGTH_BANDS:
+        if ratio >= threshold:
+            return label
+    return "Weak"
+
+
+def fetch_liquidity_walls(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT, depth_limit=LIQ_DEPTH,
+                           min_gap_mult=LIQ_MIN_GAP_MULT, sig_mult=LIQ_SIG_MULT, max_walls=LIQ_MAX_WALLS):
+    """Returns (buy_walls, sell_walls) — each a list of up to max_walls dicts
+    {price, notional, distance_pct, strength}, nearest-to-price first."""
     if not current_price:
-        return None, None
+        return [], []
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/depth",
@@ -246,7 +253,7 @@ def fetch_liquidity_walls(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT, dept
 
         bucket_size = current_price * bucket_pct
         if bucket_size <= 0:
-            return None, None
+            return [], []
         min_gap = bucket_size * min_gap_mult
 
         def build_buckets(orders):
@@ -258,39 +265,138 @@ def fetch_liquidity_walls(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT, dept
                 buckets[key] = buckets.get(key, 0) + p * q
             return buckets
 
-        def nearest_significant(buckets, direction):
+        def significant_walls(buckets, direction):
             if not buckets:
-                return None
-            values = list(buckets.values())
-            values.sort()
+                return []
+            values = sorted(buckets.values())
             mid = len(values) // 2
             median_val = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
             threshold = median_val * sig_mult
 
             if direction == "above":
-                far_enough = {lvl: n for lvl, n in buckets.items() if lvl > current_price + min_gap}
+                candidates = {lvl: n for lvl, n in buckets.items() if lvl > current_price + min_gap}
             else:
-                far_enough = {lvl: n for lvl, n in buckets.items() if lvl < current_price - min_gap}
-            if not far_enough:
-                return None
+                candidates = {lvl: n for lvl, n in buckets.items() if lvl < current_price - min_gap}
+            if not candidates:
+                return []
 
-            significant = {lvl: n for lvl, n in far_enough.items() if n >= threshold}
-            pool = significant if significant else far_enough  # fall back rather than return nothing
-            if direction == "above":
-                lvl = min(pool.keys())
-            else:
-                lvl = max(pool.keys())
-            return (lvl, pool[lvl])
+            significant = {lvl: n for lvl, n in candidates.items() if n >= threshold}
+            pool = significant if significant else candidates
+
+            ordered = sorted(pool.items(), key=lambda x: x[0] if direction == "above" else -x[0])
+            walls = []
+            for lvl, notional in ordered[:max_walls]:
+                walls.append({
+                    "price": lvl,
+                    "notional": notional,
+                    "distance_pct": abs(lvl - current_price) / current_price * 100,
+                    "strength": classify_wall_strength(notional, median_val),
+                })
+            return walls
 
         ask_buckets = build_buckets(asks)
         bid_buckets = build_buckets(bids)
-
-        sell_wall = nearest_significant(ask_buckets, "above")
-        buy_wall  = nearest_significant(bid_buckets, "below")
-        return buy_wall, sell_wall
+        sell_walls = significant_walls(ask_buckets, "above")
+        buy_walls  = significant_walls(bid_buckets, "below")
+        return buy_walls, sell_walls
     except Exception as e:
         print(f"Liquidity wall error {symbol}: {e}")
-        return None, None
+        return [], []
+
+
+def fmt_notional(v):
+    if v >= 1e6:
+        return f"${v/1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v/1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+def liquidity_totals(buy_walls, sell_walls):
+    return sum(w["notional"] for w in buy_walls), sum(w["notional"] for w in sell_walls)
+
+
+def liquidity_ratio(buy_total, sell_total):
+    if sell_total <= 0:
+        return None
+    return buy_total / sell_total
+
+
+def liquidity_bias(ratio):
+    if ratio is None:
+        return "Unclear ⚪"
+    if ratio >= 1.15:
+        return "Bullish 🟢"
+    if ratio <= 0.87:
+        return "Bearish 🔴"
+    return "Neutral ⚪"
+
+
+def liquidity_sweep(buy_total, sell_total):
+    if buy_total <= 0 or sell_total <= 0:
+        return "Unclear"
+    if abs(buy_total - sell_total) / max(buy_total, sell_total, 1) < 0.05:
+        return "Unclear"
+    return "Buy-side" if buy_total < sell_total else "Sell-side"
+
+
+def liquidity_trapped(buy_walls, sell_walls, trap_distance_pct=2.0):
+    if not buy_walls or not sell_walls:
+        return False
+    nb, ns = buy_walls[0], sell_walls[0]
+    strong_enough = nb["strength"] in ("Strong", "Extreme") and ns["strength"] in ("Strong", "Extreme")
+    close_enough = nb["distance_pct"] <= trap_distance_pct and ns["distance_pct"] <= trap_distance_pct
+    return strong_enough and close_enough
+
+
+def liquidity_score(buy_walls, sell_walls, ratio):
+    all_walls = buy_walls + sell_walls
+    if not all_walls:
+        return 0
+    avg_strength = sum(LIQ_STRENGTH_POINTS[w["strength"]] for w in all_walls) / len(all_walls)
+    completeness = len(all_walls) / (2 * LIQ_MAX_WALLS) * 100
+    imbalance = min(100, abs((ratio if ratio is not None else 1) - 1) * 100)
+    score = 0.5 * avg_strength + 0.3 * completeness + 0.2 * imbalance
+    return max(0, min(100, round(score)))
+
+
+def liquidity_verdict(trapped, bias):
+    if trapped:
+        return "Price trapped between strong liquidity.\nBreakout confirmation required."
+    if bias.startswith("Bullish"):
+        return "Liquidity favors upside continuation."
+    if bias.startswith("Bearish"):
+        return "Liquidity favors downside pressure."
+    return "No dominant liquidity bias — range conditions likely."
+
+
+def format_liquidity_block(buy_walls, sell_walls):
+    if not buy_walls and not sell_walls:
+        return "💧 <b>Liquidity</b>\nLiquidity data insufficient."
+
+    def wall_line(w, sign):
+        return f"{w['price']:.2f} {sign}{w['distance_pct']:.2f}% • {fmt_notional(w['notional'])} • {w['strength']}"
+
+    sell_lines = "\n".join(wall_line(w, "+") for w in sell_walls) if sell_walls else "—"
+    buy_lines  = "\n".join(wall_line(w, "-") for w in buy_walls) if buy_walls else "—"
+
+    buy_total, sell_total = liquidity_totals(buy_walls, sell_walls)
+    ratio    = liquidity_ratio(buy_total, sell_total)
+    bias     = liquidity_bias(ratio)
+    sweep    = liquidity_sweep(buy_total, sell_total)
+    trapped  = liquidity_trapped(buy_walls, sell_walls)
+    score    = liquidity_score(buy_walls, sell_walls, ratio)
+    verdict  = liquidity_verdict(trapped, bias)
+    ratio_disp = f"{ratio:.2f}" if ratio is not None else "—"
+
+    return (
+        f"💧 <b>Liquidity</b>\n"
+        f"🟥 Sell\n{sell_lines}\n"
+        f"🟩 Buy\n{buy_lines}\n"
+        f"Balance\nBuy {fmt_notional(buy_total)}\nSell {fmt_notional(sell_total)}\n"
+        f"Ratio {ratio_disp}\nBias: {bias}\nLikely Sweep: {sweep}\nScore: {score}/100\n"
+        f"Verdict:\n{verdict}"
+    )
 
 
 # ============================================================================
@@ -807,7 +913,7 @@ def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
     with ThreadPoolExecutor(max_workers=1) as ex:
         f_liq = ex.submit(fetch_liquidity_walls, symbol, price)
         support, resistance = calc_support_resistance(candles, price) if candles else ([], [])
-        buy_wall, sell_wall = f_liq.result()
+        buy_walls, sell_walls = f_liq.result()
 
     sig = check_signal(candles) if candles else None
 
@@ -840,13 +946,15 @@ def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
     momentum   = momentum_label(ef, es, rsi)
 
     # ---- Scoring: Confidence, Market Score, Risk ----
+    nearest_sell_tuple = (sell_walls[0]["price"], sell_walls[0]["notional"]) if sell_walls else None
+    nearest_buy_tuple  = (buy_walls[0]["price"], buy_walls[0]["notional"]) if buy_walls else None
     scores = {
         "trend":     score_trend(ef, es),
         "rsi":       score_rsi(rsi),
         "volume":    score_volume(c_vol, vol_avg),
         "funding":   score_funding(funding),
         "oi":        score_oi(oi_change),
-        "liquidity": score_liquidity(price, sell_wall, buy_wall),
+        "liquidity": score_liquidity(price, nearest_sell_tuple, nearest_buy_tuple),
         "whale":     score_whale(tt_long, buy_pct),
         "sr":        score_sr(price, support, resistance),
     }
@@ -879,18 +987,7 @@ def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
     funding_line = (f"Funding <code>{f_sign}{funding}%</code> {f_pay} · {f_crowd}"
                      if funding is not None else "Funding —")
 
-    if sell_wall:
-        sw_lvl, sw_val = sell_wall
-        sw_dist = (sw_lvl - price) / price * 100 if price else 0
-        sell_line = f"Sell Wall <code>${sw_lvl:,.2f}</code> +{sw_dist:.2f}% (${sw_val/1e6:.1f}M)"
-    else:
-        sell_line = "Sell Wall —"
-    if buy_wall:
-        bw_lvl, bw_val = buy_wall
-        bw_dist = (price - bw_lvl) / price * 100 if price else 0
-        buy_line = f"Buy Wall  <code>${bw_lvl:,.2f}</code> -{bw_dist:.2f}% (${bw_val/1e6:.1f}M)"
-    else:
-        buy_line = "Buy Wall  —"
+    liquidity_block = format_liquidity_block(buy_walls, sell_walls)
 
     whale_read = whale_interpretation(tt_long, buy_pct)
     tt_disp    = f"{tt_long}%" if tt_long is not None else "—"
@@ -947,9 +1044,7 @@ def get_full_analysis(symbol, tf_label=DEFAULT_TF_LABEL, tf_binance="1h"):
         f"{oi_line}\n"
         f"{funding_line}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💧 <b>Liquidity</b>\n"
-        f"{sell_line}\n"
-        f"{buy_line}\n"
+        f"{liquidity_block}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🐋 <b>Whales</b>\n"
         f"{whale_line}\n"
