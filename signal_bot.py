@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
+from support_resistance import calc_support_resistance
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -34,9 +36,10 @@ VOL_SMA        = 10
 CHECK_INTERVAL = 900
 CANDLE_LIMIT   = 100
 
-SR_LOOKBACK    = 5      # candles each side to confirm a swing high/low
-SR_TOLERANCE   = 0.015  # cluster swing points within 1.5% as one level
-SR_LEVELS      = 2      # how many S/R levels to keep internally each side
+SR_ALERT_TF            = "4h"    # timeframe the S/R alert levels are computed from
+SR_ALERT_CHECK_INTERVAL = 4 * 3600  # check once every 4 hours
+SR_TOUCH_PCT           = 0.3    # price within 0.3% of a level (but not past it) counts as a "hit"
+SR_STRONG_TOUCHES      = 3      # level touches >= this => "Strong", else "Light"
 
 LIQ_BUCKET_PCT   = 0.002  # 0.2% price bucket width for order book clustering
 LIQ_DEPTH        = 500    # order book depth to fetch
@@ -548,51 +551,6 @@ def overall_bias_label(score):
 
 
 
-def calc_support_resistance(candles, current_price, lookback=SR_LOOKBACK,
-                             tolerance=SR_TOLERANCE, num_levels=SR_LEVELS):
-    if not current_price or len(candles) < lookback * 2 + 3:
-        return [], []
-
-    scan = candles[:-1]  # exclude current/incomplete candle
-    highs = [c["high"] for c in scan]
-    lows  = [c["low"]  for c in scan]
-    n = len(scan)
-
-    swing_highs, swing_lows = [], []
-    for i in range(lookback, n - lookback):
-        window_h = highs[i - lookback:i + lookback + 1]
-        window_l = lows[i - lookback:i + lookback + 1]
-        if highs[i] == max(window_h):
-            swing_highs.append(highs[i])
-        if lows[i] == min(window_l):
-            swing_lows.append(lows[i])
-
-    def cluster(levels):
-        if not levels:
-            return []
-        levels = sorted(levels)
-        clusters, bucket = [], [levels[0]]
-        for lvl in levels[1:]:
-            if lvl <= bucket[-1] * (1 + tolerance):
-                bucket.append(lvl)
-            else:
-                clusters.append(bucket)
-                bucket = [lvl]
-        clusters.append(bucket)
-        return [(sum(c) / len(c), len(c)) for c in clusters]
-
-    resistance = [c for c in cluster(swing_highs) if c[0] > current_price]
-    support    = [c for c in cluster(swing_lows)  if c[0] < current_price]
-
-    resistance.sort(key=lambda x: -x[1])  # strongest (most touches) first
-    support.sort(key=lambda x: -x[1])
-
-    resistance = sorted(resistance[:num_levels], key=lambda x: x[0])   # nearest first
-    support    = sorted(support[:num_levels],    key=lambda x: -x[0])  # nearest first
-
-    return support, resistance
-
-
 # ============================================================================
 # Signal engine — LONG and SHORT
 # ============================================================================
@@ -1085,10 +1043,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def auto_signal_loop():
-    """Background loop on AUTO_SIGNAL_TF (Daily by default). Now fires both
+    """Background loop on AUTO_SIGNAL_TF (Daily by default). Fires both
     LONG and SHORT alerts, and re-arms whenever the signal direction flips
-    or clears, same debounce pattern as before."""
-    armed         = {coin: True for coin in COINS}
+    or clears: last_sig_type is the sole gate, so a direct LONG<->SHORT
+    reversal alerts immediately instead of waiting for a no-signal cycle."""
     last_sig_type = {coin: None for coin in COINS}
 
     def loop():
@@ -1102,7 +1060,7 @@ def auto_signal_loop():
                         continue
                     sig = check_signal(candles)
                     if sig:
-                        if armed[symbol] and last_sig_type[symbol] != sig["type"]:
+                        if last_sig_type[symbol] != sig["type"]:
                             oi      = fetch_oi(symbol)
                             funding = fetch_funding(symbol)
                             coin    = symbol.replace("USDT", "")
@@ -1124,13 +1082,84 @@ def auto_signal_loop():
                             )
                             send_telegram(msg)
                             print(f"Signal sent: {symbol} {sig['type']}")
-                            armed[symbol]         = False
                             last_sig_type[symbol] = sig["type"]
                     else:
-                        armed[symbol] = True
+                        last_sig_type[symbol] = None
                 except Exception as e:
                     print(f"Error {symbol}: {e}")
             time.sleep(CHECK_INTERVAL)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+def sr_strength_label(touches):
+    return "Strong" if touches >= SR_STRONG_TOUCHES else "Light"
+
+
+def sr_alert_loop():
+    """Checks every 4 hours, using S/R levels from the 4H timeframe. Alerts once per crossing on:
+      - price dipping below the nearest support (breakdown)
+      - price hitting the nearest support (within SR_TOUCH_PCT, still above it)
+      - price crossing above the nearest resistance (breakout)
+    Each condition re-arms only after price moves back out of that state,
+    same edge-triggered debounce pattern as auto_signal_loop.
+    """
+    state = {
+        symbol: {"below_support": False, "touched_support": False, "above_resistance": False}
+        for symbol in COINS
+    }
+
+    def loop():
+        while True:
+            now = datetime.now(timezone.utc)
+            print(f"[{now.strftime('%H:%M UTC')}] S/R alert check...")
+            for symbol in COINS:
+                try:
+                    price = fetch_price_ticker(symbol).get("price", 0)
+                    if not price:
+                        continue
+                    candles = fetch_candles(symbol, SR_ALERT_TF, limit=CANDLE_LIMIT)
+                    if not candles:
+                        continue
+                    support, resistance = calc_support_resistance(candles, price)
+                    coin = symbol.replace("USDT", "")
+                    s = state[symbol]
+
+                    nearest_s = support[0] if support else None
+                    nearest_r = resistance[0] if resistance else None
+
+                    below_support = nearest_s is not None and price < nearest_s[0]
+                    touching_support = (
+                        nearest_s is not None and not below_support
+                        and (price - nearest_s[0]) / nearest_s[0] * 100 <= SR_TOUCH_PCT
+                    )
+                    above_resistance = nearest_r is not None and price > nearest_r[0]
+
+                    if below_support and not s["below_support"]:
+                        strength = sr_strength_label(nearest_s[1])
+                        send_telegram(
+                            f"🔴 <b>{coin}</b> crossing below support <code>${nearest_s[0]:,.2f}</code> — {strength} support level"
+                        )
+                    s["below_support"] = below_support
+
+                    if touching_support and not s["touched_support"]:
+                        strength = sr_strength_label(nearest_s[1])
+                        send_telegram(
+                            f"🟡 <b>{coin}</b> hit support <code>${nearest_s[0]:,.2f}</code> — {strength} support level"
+                        )
+                    s["touched_support"] = touching_support
+
+                    if above_resistance and not s["above_resistance"]:
+                        strength = sr_strength_label(nearest_r[1])
+                        send_telegram(
+                            f"🟢 <b>{coin}</b> crossing resistance <code>${nearest_r[0]:,.2f}</code> — {strength} resistance level"
+                        )
+                    s["above_resistance"] = above_resistance
+
+                except Exception as e:
+                    print(f"S/R alert error {symbol}: {e}")
+            time.sleep(SR_ALERT_CHECK_INTERVAL)
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
@@ -1147,6 +1176,7 @@ def main():
     )
 
     auto_signal_loop()
+    sr_alert_loop()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

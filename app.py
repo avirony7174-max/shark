@@ -3,6 +3,8 @@ from flask_cors import CORS
 import requests
 import os
 
+from support_resistance import calc_support_resistance
+
 app = Flask(__name__)
 CORS(app)
 
@@ -11,7 +13,7 @@ CG_KEY = os.environ.get("COINGLASS_API_KEY", "")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TV_WEBHOOK_SECRET = os.environ.get("TV_WEBHOOK_SECRET", "mysecret")
+TV_WEBHOOK_SECRET = os.environ.get("TV_WEBHOOK_SECRET", "")
 
 COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LTC"]
 
@@ -25,10 +27,6 @@ COINGECKO_IDS = {
     "AVAX": "avalanche-2",
     "LTC": "litecoin"
 }
-
-SR_LOOKBACK    = 5      # candles each side to confirm a swing high/low
-SR_TOLERANCE   = 0.015  # cluster swing points within 1.5% as one level
-SR_LEVELS      = 2      # how many S/R levels to show each side
 
 LIQ_BUCKET_PCT = 0.002  # 0.2% price bucket width for order book clustering
 LIQ_CLUSTERS   = 2      # how many liquidity walls to show each side
@@ -79,9 +77,9 @@ def fetch_prices():
         for sym, gecko_id in COINGECKO_IDS.items():
             d = data.get(gecko_id, {})
             result[sym] = {
-                "price": str(d.get("usd", 0)),
-                "change": str(round(d.get("usd_24h_change", 0), 2)),
-                "volume": str(d.get("usd_24h_vol", 0)),
+                "price": str(d.get("usd") or 0),
+                "change": str(round(d.get("usd_24h_change") or 0, 2)),
+                "volume": str(d.get("usd_24h_vol") or 0),
             }
         return result
     except Exception as e:
@@ -113,51 +111,6 @@ def fetch_ohlc_coingecko(gecko_id, days=30):
     except Exception as e:
         print(f"CoinGecko OHLC error {gecko_id}: {e}")
         return []
-
-
-def calc_support_resistance(candles, current_price, lookback=SR_LOOKBACK,
-                             tolerance=SR_TOLERANCE, num_levels=SR_LEVELS):
-    if not current_price or len(candles) < lookback * 2 + 3:
-        return [], []
-
-    scan = candles[:-1]  # exclude current/incomplete candle
-    highs = [c["high"] for c in scan]
-    lows  = [c["low"]  for c in scan]
-    n = len(scan)
-
-    swing_highs, swing_lows = [], []
-    for i in range(lookback, n - lookback):
-        window_h = highs[i - lookback:i + lookback + 1]
-        window_l = lows[i - lookback:i + lookback + 1]
-        if highs[i] == max(window_h):
-            swing_highs.append(highs[i])
-        if lows[i] == min(window_l):
-            swing_lows.append(lows[i])
-
-    def cluster(levels):
-        if not levels:
-            return []
-        levels = sorted(levels)
-        clusters, bucket = [], [levels[0]]
-        for lvl in levels[1:]:
-            if lvl <= bucket[-1] * (1 + tolerance):
-                bucket.append(lvl)
-            else:
-                clusters.append(bucket)
-                bucket = [lvl]
-        clusters.append(bucket)
-        return [(sum(c) / len(c), len(c)) for c in clusters]
-
-    resistance = [c for c in cluster(swing_highs) if c[0] > current_price]
-    support    = [c for c in cluster(swing_lows)  if c[0] < current_price]
-
-    resistance.sort(key=lambda x: -x[1])  # strongest (most touches) first
-    support.sort(key=lambda x: -x[1])
-
-    resistance = sorted(resistance[:num_levels], key=lambda x: x[0])   # nearest first
-    support    = sorted(support[:num_levels],    key=lambda x: -x[0])  # nearest first
-
-    return support, resistance
 
 
 def fetch_bybit_liquidity_clusters(symbol, current_price, bucket_pct=LIQ_BUCKET_PCT,
