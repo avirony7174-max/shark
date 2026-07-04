@@ -142,7 +142,7 @@ def liquidity_view(buy_walls, sell_walls, levels):
 
     if not buy_walls or not sell_walls:
         return {"reliability": "Low", "bias": "Not reliable",
-                "note": "One-side order-book data may be incomplete — liquidity bias not reliable.",
+                "note": "⚠️ One-side data missing — liquidity bias ignored",
                 "buy_total": buy_total, "sell_total": sell_total, "sweep": None, "lean": None}
 
     ratio = buy_total / sell_total if sell_total > 0 else float("inf")
@@ -345,11 +345,16 @@ def calc_atr(candles, period=ATR_PERIOD):
 
 
 def _target_ladder(entry, risk, candidate_levels, above):
+    """Nearest real levels beyond entry, nearest first; padded out to 3 with
+    risk-multiples when there aren't enough real levels. The first padded
+    multiple is RR_MIN_FOR_TRADE itself, not something below it — otherwise a
+    thin level map (e.g. no confirmed major/macro level yet) would silently
+    produce a sub-2:1 TP1 and the whole plan gets dropped for no real reason."""
     pool = sorted({lv[0] for lv in candidate_levels if lv and (lv[0] > entry if above else lv[0] < entry)},
                   reverse=not above)
     tps = pool[:3]
     while len(tps) < 3:
-        mult = 1.5 * (len(tps) + 1)
+        mult = RR_MIN_FOR_TRADE + 1.5 * len(tps)
         tps.append(entry + risk * mult if above else entry - risk * mult)
     return tps
 
@@ -418,18 +423,31 @@ def build_score(direction, ef, es, rsi, momentum, bull_trend, bear_trend, c_vol,
         "whale":        _to_points(sb.score_whale(tt_long, buy_pct), SCORE_WEIGHTS["whale"], direction),
         "sr":           _to_points(sb.score_sr(price, sr_support, sr_resistance), SCORE_WEIGHTS["sr"], direction),
     }
+
+    # A missing order-book side is not usable signal — force the floor
+    # regardless of what score_liquidity computed from the remaining side.
+    if liquidity_reliability == "Low":
+        points["liquidity"] = min(points["liquidity"], 2.0)
+
     raw_total = sum(points.values())
 
     cap_reasons = []
     max_score = 100
 
-    higher_tf_opposes = (
-        (direction == "LONG" and (bias_map.get("4h") == "Bearish" or bias_map.get("1d") == "Bearish")) or
-        (direction == "SHORT" and (bias_map.get("4h") == "Bullish" or bias_map.get("1d") == "Bullish"))
-    )
-    if higher_tf_opposes:
+    conflicting_tfs = []
+    if direction == "LONG":
+        if bias_map.get("4h") == "Bearish":
+            conflicting_tfs.append("4H")
+        if bias_map.get("1d") == "Bearish":
+            conflicting_tfs.append("Daily")
+    else:
+        if bias_map.get("4h") == "Bullish":
+            conflicting_tfs.append("4H")
+        if bias_map.get("1d") == "Bullish":
+            conflicting_tfs.append("Daily")
+    if conflicting_tfs:
         max_score = min(max_score, 65)
-        cap_reasons.append("4H/Daily disagree with setup")
+        cap_reasons.append(f"{' and '.join(conflicting_tfs)} trend opposes intraday setup")
 
     if vol_pct is not None and vol_pct < VOLUME_WEAK_PCT:
         max_score = min(max_score, 55)
@@ -457,30 +475,25 @@ def build_score(direction, ef, es, rsi, momentum, bull_trend, bear_trend, c_vol,
     return score, points, cap_reasons
 
 
-def score_band_label(score):
-    if score <= 35:
-        return "High Risk / No Trade"
-    if score <= 49:
-        return "Weak Setup"
-    if score <= 64:
-        return "Watch Setup"
-    if score <= 74:
-        return "Moderate Setup"
-    if score <= 84:
-        return "Strong Setup"
-    return "Rare high-confluence setup"
 
 
 # ============================================================================
 # Recommendation state machine
 # ============================================================================
 
-def determine_candidate(sig, price, levels):
+def determine_candidate(sig, price, levels, bull_trend, bear_trend):
     if sig:
         return sig["type"]
     if levels["immediate_r"] and price > levels["immediate_r"][0]:
         return "LONG"
     if levels["immediate_s"] and price < levels["immediate_s"][0]:
+        return "SHORT"
+    # No breakout/pullback signal yet, but a clear intraday trend (price above
+    # or below both EMAs) is still a WATCH candidate — e.g. bullish 15m/1H/4H
+    # sitting below resistance, waiting for the close that would confirm it.
+    if bull_trend:
+        return "LONG"
+    if bear_trend:
         return "SHORT"
     return None
 
@@ -534,23 +547,30 @@ def recommend(direction, price, candles, levels, bias_map, checklist_score, rr,
     return "WAIT"
 
 
-def verdict_reason(verdict, alignment, cap_reasons, checklist_score, direction):
+def verdict_reason(verdict, direction, levels, checklist_score):
     if verdict == "NO TRADE — HIGH RISK":
-        return "Elevated risk conditions (crowding, chop, or unreliable data) — avoid new entries."
+        return "High-risk conditions — avoid new entries."
     if verdict == "WAIT":
-        if alignment not in ("Strong Bullish", "Strong Bearish"):
-            return "Short-term structure may look directional, but higher timeframes disagree or don't confirm — no edge yet."
         if direction and checklist_score < 2:
-            return "A setup is forming but the confirmation checklist is too thin to act on."
-        return "No clear directional edge right now — standing aside."
+            return "Setup forming, but confirmation is too thin to act on."
+        return "Signals mixed or unconfirmed — no clear setup."
     if verdict in ("LONG WATCH", "SHORT WATCH"):
-        reason = "Intraday trend, volume, and flow support this direction"
-        if cap_reasons:
-            reason += f", but {', '.join(cap_reasons)}"
-        return reason + " — wait for breakout/retest confirmation before sizing up."
+        level = levels.get("immediate_r") if verdict == "LONG WATCH" else levels.get("immediate_s")
+        verb = "above" if verdict == "LONG WATCH" else "below"
+        if level:
+            return f"Strong intraday flow, but wait for 1H close {verb} ${level[0]:,.2f}."
+        return "Strong intraday flow, but breakout not yet confirmed."
     if verdict in ("STRONG LONG", "STRONG SHORT"):
-        return "Trend, volume, OI, and liquidity all line up with an acceptable risk/reward — higher-conviction setup."
+        return "Trend, volume, OI, and liquidity all align with acceptable risk/reward."
     return ""
+
+
+def verdict_action(verdict):
+    if verdict == "LONG WATCH":
+        return "Do not chase below resistance."
+    if verdict == "SHORT WATCH":
+        return "Do not chase above support."
+    return None
 
 
 def key_alerts(levels, funding, direction, vol_spike_pct=110, oi_spike_pct=3):
@@ -635,7 +655,7 @@ def get_full_analysis_v2(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
     sr_support_list    = [levels["immediate_s"]] if levels["immediate_s"] else []
     sr_resistance_list = [levels["immediate_r"]] if levels["immediate_r"] else []
 
-    sig_candidate = determine_candidate(sig, price, levels)
+    sig_candidate = determine_candidate(sig, price, levels, bull_trend, bear_trend)
     direction_for_score = sig_candidate or ("LONG" if bull_trend else "SHORT" if bear_trend else "LONG")
 
     score, points, cap_reasons = build_score(
@@ -661,7 +681,8 @@ def get_full_analysis_v2(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
 
     verdict = recommend(sig_candidate, price, candles, levels, bias_map, checklist_score, rr,
                          oi_change, funding, liquidity, vol_pct, score, trapped, risk_level)
-    reason = verdict_reason(verdict, alignment, cap_reasons, checklist_score, sig_candidate)
+    reason = verdict_reason(verdict, sig_candidate, levels, checklist_score)
+    action = verdict_action(verdict)
 
     alerts = key_alerts(levels, funding, sig_candidate)
 
@@ -675,7 +696,7 @@ def get_full_analysis_v2(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
         vol_pct=vol_pct,
         sig_candidate=sig_candidate, checks=checks, checklist_score=checklist_score,
         points=points, score=score, cap_reasons=cap_reasons,
-        plan=plan, verdict=verdict, reason=reason, alerts=alerts,
+        plan=plan, verdict=verdict, reason=reason, action=action, alerts=alerts,
     )
 
 
@@ -719,8 +740,8 @@ def render_message(**d):
     liq = d["liquidity"]
     lines.append("\U0001F4A7 <b>Liquidity</b>")
     if liq["note"]:
-        buy_disp = sb.fmt_notional(liq["buy_total"]) if liq["buy_total"] else "Data unavailable"
-        sell_disp = sb.fmt_notional(liq["sell_total"]) if liq["sell_total"] else "Data unavailable"
+        buy_disp = sb.fmt_notional(liq["buy_total"]) if liq["buy_total"] else "data unavailable"
+        sell_disp = sb.fmt_notional(liq["sell_total"]) if liq["sell_total"] else "data unavailable"
         lines.append(f"Buy {buy_disp} | Sell {sell_disp}")
         lines.append(f"Reliability: Low")
         lines.append(f"Bias: {liq['bias']}")
@@ -766,8 +787,8 @@ def render_message(**d):
         f"Whale {p['whale']:.0f}/{SCORE_WEIGHTS['whale']} · "
         f"S/R {p['sr']:.0f}/{SCORE_WEIGHTS['sr']}"
     )
-    cap_note = f" — capped: {', '.join(d['cap_reasons'])}" if d["cap_reasons"] else ""
-    lines.append(f"Total: {d['score']}/100{cap_note} ({score_band_label(d['score'])})")
+    cap_note = f" — capped: {'; '.join(d['cap_reasons'])}" if d["cap_reasons"] else ""
+    lines.append(f"Total: {d['score']}/100{cap_note}")
     lines.append("")
 
     if d["plan"]:
@@ -789,6 +810,8 @@ def render_message(**d):
     lines.append(f"⚠️ <b>Verdict: {d['verdict']}</b>")
     if d.get("reason"):
         lines.append(f"Reason: {d['reason']}")
+    if d.get("action"):
+        lines.append(f"Action: {d['action']}")
     lines.append("")
 
     lines.append("\U0001F514 <b>Key Alerts Armed</b>")
