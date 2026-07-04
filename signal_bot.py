@@ -32,7 +32,7 @@ AUTO_SIGNAL_TF    = "1d"   # auto signal loop stays on Daily (kept configurable 
 EMA_FAST       = 21
 EMA_SLOW       = 50
 RSI_PERIOD     = 14
-VOL_SMA        = 10
+VOL_SMA        = 20
 CHECK_INTERVAL = 900
 CANDLE_LIMIT   = 100
 
