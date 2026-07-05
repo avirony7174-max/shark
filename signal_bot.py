@@ -1,10 +1,12 @@
 import asyncio
 import os
+import smtplib
 import time
 import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
@@ -12,6 +14,13 @@ from support_resistance import calc_support_resistance
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# Email alerts (Gmail SMTP + App Password) run alongside Telegram. All three
+# must be set (in Railway's env vars, never in code) or notify() just skips
+# the email leg and Telegram-only behavior is unchanged.
+GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+ALERT_EMAIL_TO     = os.environ.get("ALERT_EMAIL_TO", "")
 
 COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT"]
 VALID_COINS = {
@@ -41,6 +50,9 @@ SR_ALERT_CHECK_INTERVAL = 4 * 3600  # check once every 4 hours
 SR_TOUCH_PCT           = 0.3    # price within 0.3% of a level (but not past it) counts as a "hit"
 SR_STRONG_TOUCHES      = 3      # level touches >= this => "Strong", else "Light"
 
+OPPORTUNITY_TF             = "1h"   # timeframe the 24/7 opportunity scanner analyzes
+OPPORTUNITY_CHECK_INTERVAL = 900    # 15 min, matches CHECK_INTERVAL's cadence
+
 LIQ_BUCKET_PCT   = 0.002  # 0.2% price bucket width for order book clustering
 LIQ_DEPTH        = 500    # order book depth to fetch
 LIQ_MIN_GAP_MULT = 0.5    # buckets within 0.5 bucket-widths of price are "at market", not a wall
@@ -62,6 +74,30 @@ def send_telegram(message):
         }, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
+
+
+def send_email(subject, message):
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD or not ALERT_EMAIL_TO:
+        print("Email credentials missing")
+        return
+    try:
+        recipients = [addr.strip() for addr in ALERT_EMAIL_TO.split(",") if addr.strip()]
+        msg = MIMEText(message, "html", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = GMAIL_ADDRESS
+        msg["To"] = ", ".join(recipients)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_ADDRESS, recipients, msg.as_string())
+    except Exception as e:
+        print(f"Email error: {e}")
+
+
+def notify(subject, message):
+    """Fan-out to every configured channel. Telegram and email each fail
+    independently (one being down/misconfigured never blocks the other)."""
+    send_telegram(message)
+    send_email(subject, message)
 
 
 # ============================================================================
@@ -654,7 +690,7 @@ def auto_signal_loop():
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"<i>EMA Swing 21/50 · RR 1:3</i>"
                             )
-                            send_telegram(msg)
+                            notify(f"{coin} {sig['type']} Signal", msg)
                             print(f"Signal sent: {symbol} {sig['type']}")
                             last_sig_type[symbol] = sig["type"]
                     else:
@@ -712,21 +748,24 @@ def sr_alert_loop():
 
                     if below_support and not s["below_support"]:
                         strength = sr_strength_label(nearest_s[1])
-                        send_telegram(
+                        notify(
+                            f"{coin} broke below support",
                             f"🔴 <b>{coin}</b> crossing below support <code>${nearest_s[0]:,.2f}</code> — {strength} support level"
                         )
                     s["below_support"] = below_support
 
                     if touching_support and not s["touched_support"]:
                         strength = sr_strength_label(nearest_s[1])
-                        send_telegram(
+                        notify(
+                            f"{coin} hit support",
                             f"🟡 <b>{coin}</b> hit support <code>${nearest_s[0]:,.2f}</code> — {strength} support level"
                         )
                     s["touched_support"] = touching_support
 
                     if above_resistance and not s["above_resistance"]:
                         strength = sr_strength_label(nearest_r[1])
-                        send_telegram(
+                        notify(
+                            f"{coin} broke resistance",
                             f"🟢 <b>{coin}</b> crossing resistance <code>${nearest_r[0]:,.2f}</code> — {strength} resistance level"
                         )
                     s["above_resistance"] = above_resistance
@@ -739,9 +778,72 @@ def sr_alert_loop():
     t.start()
 
 
+def opportunity_scan_loop():
+    """24/7 scanner using analysis_v2's full pipeline (multi-timeframe
+    alignment, volume/OI/liquidity confirmation, breakout checklist, R/R
+    gating) on the 1H timeframe. Alerts ONLY on STRONG LONG / STRONG SHORT —
+    recommend()'s strict gate already requires all 4 timeframes aligned,
+    volume >=110% average, OI supporting, liquidity not opposing, R/R >= 2,
+    and score >= 75, so a STRONG verdict here is never a lone indicator.
+
+    The alert includes the generated trade plan (entry/SL/TP1-3/R:R) and the
+    underlying 0-100 score, labeled as a technical confidence score — it is
+    NOT a backtested win rate, since this bot has no historical trade log to
+    derive one from.
+
+    Re-arms on flip/clear (last_alert_type is the sole gate), same
+    debounce pattern as auto_signal_loop — a direct LONG<->SHORT reversal
+    alerts immediately instead of waiting for the state to clear first.
+    """
+    last_alert_type = {symbol: None for symbol in COINS}
+
+    def loop():
+        import analysis_v2  # lazy: analysis_v2 imports this module
+        while True:
+            now = datetime.now(timezone.utc)
+            print(f"[{now.strftime('%H:%M UTC')}] Opportunity scan...")
+            for symbol in COINS:
+                try:
+                    data = analysis_v2.analyze(symbol, "1H", OPPORTUNITY_TF)
+                    verdict = data["verdict"]
+                    direction = "LONG" if verdict == "STRONG LONG" else "SHORT" if verdict == "STRONG SHORT" else None
+
+                    if direction:
+                        if last_alert_type[symbol] != direction:
+                            plan = data.get("plan")
+                            coin = symbol.replace("USDT", "")
+                            if plan:
+                                emoji = "🟢" if direction == "LONG" else "🔴"
+                                msg = (
+                                    f"{emoji} <b>{verdict}</b> — <b>{coin}/USDT</b> · 1H\n"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"Entry: <code>${plan['entry']:,.2f}</code>\n"
+                                    f"SL:      <code>${plan['sl']:,.2f}</code>\n"
+                                    f"TP1:    <code>${plan['tp1']:,.2f}</code>\n"
+                                    f"TP2:    <code>${plan['tp2']:,.2f}</code>\n"
+                                    f"TP3:    <code>${plan['tp3']:,.2f}</code>\n"
+                                    f"R/R:     1:{plan['rr']:.1f}\n"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"Confidence Score: <code>{data['score']}/100</code>\n"
+                                    f"<i>Technical confidence score, not a guaranteed win rate</i>"
+                                )
+                                notify(f"{coin} {verdict}", msg)
+                                print(f"Opportunity alert sent: {symbol} {verdict}")
+                        last_alert_type[symbol] = direction
+                    else:
+                        last_alert_type[symbol] = None
+                except Exception as e:
+                    print(f"Opportunity scan error {symbol}: {e}")
+            time.sleep(OPPORTUNITY_CHECK_INTERVAL)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
 def main():
     print("Signal Bot starting...")
-    send_telegram(
+    notify(
+        "Signal Bot started",
         "✅ <b>Signal Bot চালু হয়েছে</b>\n"
         "BTC · ETH · SOL · LINK monitoring\n\n"
         "যেকোনো সময় লিখো:\n"
@@ -751,6 +853,7 @@ def main():
 
     auto_signal_loop()
     sr_alert_loop()
+    opportunity_scan_loop()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
