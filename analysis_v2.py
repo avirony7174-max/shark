@@ -593,7 +593,11 @@ def key_alerts(levels, funding, direction, vol_spike_pct=110, oi_spike_pct=3):
 # Orchestration
 # ============================================================================
 
-def get_full_analysis_v2(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
+def analyze(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
+    """Fetches and scores one symbol; returns the kwargs dict render_message
+    expects. Split out from get_full_analysis_v2 so compare_coins() can pull
+    just the score/verdict across several symbols without rendering each
+    one's full message."""
     coin = symbol.replace("USDT", "")
 
     with ThreadPoolExecutor(max_workers=11) as ex:
@@ -686,7 +690,7 @@ def get_full_analysis_v2(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
 
     alerts = key_alerts(levels, funding, sig_candidate)
 
-    return render_message(
+    return dict(
         coin=coin, tf_label=tf_label, price=price, change=change,
         ef=ef, es=es, cross_label=cross_label, rsi=rsi, momentum=momentum,
         bias_map=bias_map, alignment=alignment, levels=levels,
@@ -698,6 +702,63 @@ def get_full_analysis_v2(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
         points=points, score=score, cap_reasons=cap_reasons,
         plan=plan, verdict=verdict, reason=reason, action=action, alerts=alerts,
     )
+
+
+def get_full_analysis_v2(symbol, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
+    return render_message(**analyze(symbol, tf_label, tf_binance))
+
+
+TIER_ORDER = {
+    "STRONG LONG": 0, "STRONG SHORT": 0,
+    "LONG WATCH": 1, "SHORT WATCH": 1,
+    "WAIT": 2,
+    "NO TRADE — HIGH RISK": 3,
+}
+
+
+def compare_coins(symbols, tf_label=sb.DEFAULT_TF_LABEL, tf_binance="1h"):
+    """'trade'-command entry point: scores every symbol and ranks them by
+    verdict tier (STRONG > WATCH > WAIT > NO TRADE), then by score within a
+    tier, so the trader sees which pair currently has the best actionable
+    setup instead of having to run each one separately.
+
+    Symbols are processed one at a time, not in parallel: each analyze()
+    call already opens ~11 concurrent connections internally (MTF candles +
+    ticker + OI + funding + taker + top-trader + liquidity), so running 4
+    symbols in parallel on top of that briefly opened ~44 simultaneous
+    connections to Binance and got most of them rate-limited/timed out in
+    testing, silently defaulting every score to near-identical neutral
+    values. Sequential keeps peak concurrency the same as a single /BTC
+    request."""
+    results = {}
+    for sym in symbols:
+        try:
+            results[sym] = analyze(sym, tf_label, tf_binance)
+        except Exception as e:
+            print(f"compare_coins error {sym}: {e}")
+            results[sym] = None
+
+    rows = [(sym, sym.replace("USDT", ""), results[sym]) for sym in symbols]
+    rows.sort(key=lambda r: (9, 0) if r[2] is None else (TIER_ORDER.get(r[2]["verdict"], 2), -r[2]["score"]))
+
+    lines = [f"\U0001F4CA <b>Trade Scan</b> | {tf_label}", ""]
+    for sym, coin, data in rows:
+        if data is None:
+            lines.append(f"{coin:<5} —  data unavailable")
+        else:
+            lines.append(f"{coin:<5} {data['score']}/100  {data['verdict']}")
+    lines.append("")
+
+    best = next((r for r in rows if r[2] is not None and TIER_ORDER.get(r[2]["verdict"], 2) < 2), None)
+    if best:
+        sym, coin, data = best
+        lines.append(f"\U0001F3C6 Best setup: <b>{coin}</b> — {data['verdict']} ({data['score']}/100)")
+        if data.get("reason"):
+            lines.append(data["reason"])
+    else:
+        lines.append("⚠️ No actionable setup right now — all WAIT or high risk.")
+
+    return "\n".join(lines)
 
 
 def render_message(**d):

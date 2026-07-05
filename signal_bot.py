@@ -563,6 +563,17 @@ def parse_message(text):
     return symbol, tf_label, TIMEFRAME_ALIASES[tf_label]
 
 
+def parse_trade_command(text):
+    """'trade' -> ('1H', '1h'); 'trade 4H' -> ('4H', '4h'); else None."""
+    parts = (text or "").strip().upper().split()
+    if not parts or parts[0] != "TRADE":
+        return None
+    tf_label = DEFAULT_TF_LABEL
+    if len(parts) >= 2 and parts[1] in TIMEFRAME_ALIASES:
+        tf_label = parts[1]
+    return tf_label, TIMEFRAME_ALIASES[tf_label]
+
+
 # ============================================================================
 # Telegram handlers
 # ============================================================================
@@ -570,7 +581,21 @@ def parse_message(text):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import analysis_v2  # lazy import: analysis_v2 imports this module, so importing
                          # it back at module load time would be circular.
-    symbol, tf_label, tf_binance = parse_message(update.message.text)
+    text = update.message.text
+    trade_cmd = parse_trade_command(text)
+    if trade_cmd:
+        tf_label, tf_binance = trade_cmd
+        await update.message.reply_text("⏳ Scanning BTC, ETH, SOL, LINK...")
+        try:
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, analysis_v2.compare_coins, COINS, tf_label, tf_binance)
+            await update.message.reply_text(msg, parse_mode="HTML")
+        except Exception as e:
+            print(f"handle_message trade error: {e}")
+            await update.message.reply_text("❌ Error scanning coins. Try again.")
+        return
+
+    symbol, tf_label, tf_binance = parse_message(text)
     if symbol:
         await update.message.reply_text("⏳ Fetching data...")
         try:
@@ -585,7 +610,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send a coin (optionally with timeframe):\n"
             "<b>BTC · ETH · SOL · LINK</b>\n"
             "e.g. <code>BTC</code>, <code>BTC 1H</code>, <code>ETH 4H</code>, <code>SOL 15M</code>\n"
-            "Timeframes: 15M · 30M · 1H · 4H · 1D (default 1H)",
+            "Timeframes: 15M · 30M · 1H · 4H · 1D (default 1H)\n\n"
+            "Or send <b>TRADE</b> to compare all coins and see which has the best setup right now.",
             parse_mode="HTML"
         )
 
