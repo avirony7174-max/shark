@@ -15,6 +15,9 @@ from support_resistance import calc_support_resistance
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
 # Email alerts (Gmail SMTP + App Password) run alongside Telegram. All three
 # must be set (in Railway's env vars, never in code) or notify() just skips
 # the email leg and Telegram-only behavior is unchanged.
@@ -98,6 +101,115 @@ def notify(subject, message):
     independently (one being down/misconfigured never blocks the other)."""
     send_telegram(message)
     send_email(subject, message)
+
+
+# ============================================================================
+# Supabase signal tracking
+# ============================================================================
+
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def log_signal(symbol, sig_type, entry, sl, tp, timeframe):
+    try:
+        payload = {
+            "symbol": symbol, "signal_type": sig_type,
+            "entry": entry, "sl": sl, "tp": tp,
+            "timeframe": timeframe, "status": "OPEN",
+        }
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/signal_log",
+                           headers=supabase_headers(), json=payload, timeout=10)
+        if r.status_code not in (200, 201):
+            print(f"Supabase log error: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"Supabase log error: {e}")
+
+
+def fetch_open_signals():
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log",
+                          headers=supabase_headers(),
+                          params={"status": "eq.OPEN", "select": "*"}, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"Supabase fetch error: {e}")
+    return []
+
+
+def close_signal(row_id, status, exit_price, pnl_pct):
+    try:
+        payload = {"status": status, "exit_price": exit_price, "pnl_pct": pnl_pct,
+                   "closed_at": datetime.now(timezone.utc).isoformat()}
+        requests.patch(f"{SUPABASE_URL}/rest/v1/signal_log",
+                        headers=supabase_headers(),
+                        params={"id": f"eq.{row_id}"}, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Supabase close error: {e}")
+
+
+def signal_tracker_loop():
+    def loop():
+        while True:
+            try:
+                for sig in fetch_open_signals():
+                    symbol = sig["symbol"]
+                    ticker = fetch_price_ticker(symbol)
+                    price = ticker.get("price", 0)
+                    if not price:
+                        continue
+                    sig_type = sig["signal_type"]
+                    entry, sl, tp = float(sig["entry"]), float(sig["sl"]), float(sig["tp"])
+
+                    if sig_type == "LONG":
+                        if price >= tp:
+                            close_signal(sig["id"], "TP_HIT", tp, round((tp - entry) / entry * 100, 2))
+                        elif price <= sl:
+                            close_signal(sig["id"], "SL_HIT", sl, round((sl - entry) / entry * 100, 2))
+                    else:
+                        if price <= tp:
+                            close_signal(sig["id"], "TP_HIT", tp, round((entry - tp) / entry * 100, 2))
+                        elif price >= sl:
+                            close_signal(sig["id"], "SL_HIT", sl, round((entry - sl) / entry * 100, 2))
+            except Exception as e:
+                print(f"Signal tracker error: {e}")
+            time.sleep(CHECK_INTERVAL)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+def format_stats():
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log",
+                          headers=supabase_headers(),
+                          params={"status": "neq.OPEN", "select": "*"}, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"Stats fetch error: {e}")
+        rows = []
+
+    if not rows:
+        return "📊 <b>Signal Track Record</b>\nNo closed signals yet."
+
+    wins = [r for r in rows if r["status"] == "TP_HIT"]
+    losses = [r for r in rows if r["status"] == "SL_HIT"]
+    total = len(wins) + len(losses)
+    win_rate = (len(wins) / total * 100) if total else 0
+    avg_pnl = sum(float(r["pnl_pct"]) for r in rows) / len(rows)
+
+    return (
+        f"📊 <b>Signal Track Record</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Total closed: <code>{total}</code>\n"
+        f"Wins (TP): <code>{len(wins)}</code>   Losses (SL): <code>{len(losses)}</code>\n"
+        f"Win rate: <code>{win_rate:.1f}%</code>\n"
+        f"Avg PnL: <code>{avg_pnl:+.2f}%</code>"
+    )
 
 
 # ============================================================================
@@ -618,6 +730,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import analysis_v2  # lazy import: analysis_v2 imports this module, so importing
                          # it back at module load time would be circular.
     text = update.message.text
+    if (text or "").strip().upper() == "STATS":
+        await update.message.reply_text(format_stats(), parse_mode="HTML")
+        return
+
     trade_cmd = parse_trade_command(text)
     if trade_cmd:
         tf_label, tf_binance = trade_cmd
@@ -691,6 +807,7 @@ def auto_signal_loop():
                                 f"<i>EMA Swing 21/50 · RR 1:3</i>"
                             )
                             notify(f"{coin} {sig['type']} Signal", msg)
+                            log_signal(symbol, sig["type"], sig["entry"], sig["sl"], sig["tp"], "DAILY")
                             print(f"Signal sent: {symbol} {sig['type']}")
                             last_sig_type[symbol] = sig["type"]
                     else:
@@ -854,6 +971,7 @@ def main():
     auto_signal_loop()
     sr_alert_loop()
     opportunity_scan_loop()
+    signal_tracker_loop()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
