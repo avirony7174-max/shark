@@ -53,6 +53,10 @@ SR_ALERT_CHECK_INTERVAL = 4 * 3600  # check once every 4 hours
 SR_TOUCH_PCT           = 0.3    # price within 0.3% of a level (but not past it) counts as a "hit"
 SR_STRONG_TOUCHES      = 3      # level touches >= this => "Strong", else "Light"
 
+DUMP_PUMP_TF_LABEL       = "4H"  # timeframe label passed to analysis_v2 for the fired alert
+DUMP_PUMP_TF_BINANCE     = "4h"  # matches SR_ALERT_TF, so the support level and the alert's own analysis agree
+DUMP_PUMP_MAX_WAIT_CHECKS = 8    # give up waiting for a reclaim after this many CHECK_INTERVAL polls (~2h)
+
 OPPORTUNITY_TF             = "1h"   # timeframe the 24/7 opportunity scanner analyzes
 OPPORTUNITY_CHECK_INTERVAL = 900    # 15 min, matches CHECK_INTERVAL's cadence
 
@@ -895,6 +899,73 @@ def sr_alert_loop():
     t.start()
 
 
+def dump_pump_loop():
+    """Detects a 'sweep and reclaim': price dips below a Strong 4H support
+    level (SR_STRONG_TOUCHES+ touches, same bar sr_alert_loop uses), then
+    closes back above that same level within DUMP_PUMP_MAX_WAIT_CHECKS polls.
+    Fires once per sweep with the full analysis_v2 breakdown so you can judge
+    the reclaim, not just know it happened. A reclaim that takes too long is
+    treated as a real breakdown (not a sweep) and does not fire; neither does
+    a dip below a Light support level.
+    """
+    state = {symbol: {"waiting": False, "level": None, "checks": 0} for symbol in COINS}
+
+    def loop():
+        while True:
+            now = datetime.now(timezone.utc)
+            print(f"[{now.strftime('%H:%M UTC')}] Dump & Pump check...")
+            for symbol in COINS:
+                try:
+                    price = fetch_price_ticker(symbol).get("price", 0)
+                    if not price:
+                        continue
+                    candles = fetch_candles(symbol, SR_ALERT_TF, limit=CANDLE_LIMIT)
+                    if not candles:
+                        continue
+                    support, _ = calc_support_resistance(candles, price)
+                    coin = symbol.replace("USDT", "")
+                    s = state[symbol]
+
+                    if not s["waiting"]:
+                        nearest_s = support[0] if support else None
+                        if nearest_s and nearest_s[1] >= SR_STRONG_TOUCHES and price < nearest_s[0]:
+                            s["waiting"] = True
+                            s["level"] = nearest_s[0]
+                            s["checks"] = 0
+                    else:
+                        s["checks"] += 1
+                        if price >= s["level"]:
+                            import analysis_v2  # lazy: analysis_v2 imports this module (circular)
+                            try:
+                                analysis = analysis_v2.get_full_analysis_v2(
+                                    symbol, DUMP_PUMP_TF_LABEL, DUMP_PUMP_TF_BINANCE
+                                )
+                            except Exception as e:
+                                analysis = f"(analysis error: {e})"
+                            msg = (
+                                f"🔄 <b>DUMP & PUMP SIGNAL</b>\n"
+                                f"<b>{coin}/USDT</b> swept support <code>${s['level']:,.2f}</code> and reclaimed\n"
+                                f"━━━━━━━━━━━━━━━\n"
+                                f"{analysis}"
+                            )
+                            notify(f"{coin} DUMP & PUMP", msg)
+                            print(f"Dump & Pump signal: {symbol} reclaimed {s['level']}")
+                            s["waiting"] = False
+                            s["level"] = None
+                            s["checks"] = 0
+                        elif s["checks"] >= DUMP_PUMP_MAX_WAIT_CHECKS:
+                            s["waiting"] = False
+                            s["level"] = None
+                            s["checks"] = 0
+
+                except Exception as e:
+                    print(f"Dump & Pump error {symbol}: {e}")
+            time.sleep(CHECK_INTERVAL)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
 def opportunity_scan_loop():
     """24/7 scanner using analysis_v2's full pipeline (multi-timeframe
     alignment, volume/OI/liquidity confirmation, breakout checklist, R/R
@@ -972,6 +1043,7 @@ def main():
     sr_alert_loop()
     opportunity_scan_loop()
     signal_tracker_loop()
+    dump_pump_loop()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
