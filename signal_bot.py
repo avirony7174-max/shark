@@ -216,6 +216,46 @@ def format_stats():
     )
 
 
+def fetch_month_signals():
+    """All signal_log rows (any status) logged since the start of the
+    current UTC calendar month."""
+    try:
+        month_start = datetime.now(timezone.utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log",
+                          headers=supabase_headers(),
+                          params={"created_at": f"gte.{month_start}", "select": "*"}, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"Supabase month fetch error: {e}")
+    return []
+
+
+def format_month_stats():
+    rows = fetch_month_signals()
+    month_label = datetime.now(timezone.utc).strftime("%B %Y")
+
+    if not rows:
+        return f"📅 <b>Signals — {month_label}</b>\nNo signals fired yet this month."
+
+    wins = [r for r in rows if r["status"] == "TP_HIT"]
+    losses = [r for r in rows if r["status"] == "SL_HIT"]
+    open_ = [r for r in rows if r["status"] == "OPEN"]
+    closed = len(wins) + len(losses)
+    win_rate = (len(wins) / closed * 100) if closed else 0
+
+    return (
+        f"📅 <b>Signals — {month_label}</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Total fired: <code>{len(rows)}</code>\n"
+        f"Open: <code>{len(open_)}</code>   Closed: <code>{closed}</code>\n"
+        f"Wins (TP): <code>{len(wins)}</code>   Losses (SL): <code>{len(losses)}</code>\n"
+        f"Win rate (closed): <code>{win_rate:.1f}%</code>"
+    )
+
+
 # ============================================================================
 # Binance fetchers
 # ============================================================================
@@ -738,6 +778,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(format_stats(), parse_mode="HTML")
         return
 
+    if (text or "").strip().upper() == "MONTH":
+        await update.message.reply_text(format_month_stats(), parse_mode="HTML")
+        return
+
     trade_cmd = parse_trade_command(text)
     if trade_cmd:
         tf_label, tf_binance = trade_cmd
@@ -767,7 +811,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>BTC · ETH · SOL · LINK</b>\n"
             "e.g. <code>BTC</code>, <code>BTC 1H</code>, <code>ETH 4H</code>, <code>SOL 15M</code>\n"
             "Timeframes: 15M · 30M · 1H · 4H · 1D (default 1H)\n\n"
-            "Or send <b>TRADE</b> to compare all coins and see which has the best setup right now.",
+            "Or send <b>TRADE</b> to compare all coins and see which has the best setup right now.\n"
+            "<b>STATS</b> — all-time signal win rate. <b>MONTH</b> — this month's signal count.",
             parse_mode="HTML"
         )
 
