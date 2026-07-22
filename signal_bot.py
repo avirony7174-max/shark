@@ -246,10 +246,19 @@ def format_month_stats():
     closed = len(wins) + len(losses)
     win_rate = (len(wins) / closed * 100) if closed else 0
 
+    by_source = {}
+    for r in rows:
+        by_source.setdefault(r["timeframe"], []).append(r)
+    source_lines = "\n".join(
+        f"  {src}: <code>{len(src_rows)}</code>" for src, src_rows in sorted(by_source.items())
+    )
+
     return (
         f"📅 <b>Signals — {month_label}</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"Total fired: <code>{len(rows)}</code>\n"
+        f"{source_lines}\n"
+        f"━━━━━━━━━━━━━━━\n"
         f"Open: <code>{len(open_)}</code>   Closed: <code>{closed}</code>\n"
         f"Wins (TP): <code>{len(wins)}</code>   Losses (SL): <code>{len(losses)}</code>\n"
         f"Win rate (closed): <code>{win_rate:.1f}%</code>"
@@ -981,10 +990,11 @@ def dump_pump_loop():
                         s["checks"] += 1
                         if price >= s["level"]:
                             import analysis_v2  # lazy: analysis_v2 imports this module (circular)
+                            plan = None
                             try:
-                                analysis = analysis_v2.get_full_analysis_v2(
-                                    symbol, DUMP_PUMP_TF_LABEL, DUMP_PUMP_TF_BINANCE
-                                )
+                                data = analysis_v2.analyze(symbol, DUMP_PUMP_TF_LABEL, DUMP_PUMP_TF_BINANCE)
+                                analysis = analysis_v2.render_message(**data)
+                                plan = data.get("plan")
                             except Exception as e:
                                 analysis = f"(analysis error: {e})"
                             msg = (
@@ -994,6 +1004,8 @@ def dump_pump_loop():
                                 f"{analysis}"
                             )
                             notify(f"{coin} DUMP & PUMP", msg)
+                            if plan:
+                                log_signal(symbol, data["sig_candidate"], plan["entry"], plan["sl"], plan["tp1"], "DUMP_PUMP")
                             print(f"Dump & Pump signal: {symbol} reclaimed {s['level']}")
                             s["waiting"] = False
                             s["level"] = None
@@ -1061,6 +1073,7 @@ def opportunity_scan_loop():
                                     f"<i>Technical confidence score, not a guaranteed win rate</i>"
                                 )
                                 notify(f"{coin} {verdict}", msg)
+                                log_signal(symbol, direction, plan["entry"], plan["sl"], plan["tp1"], "1H-OPP")
                                 print(f"Opportunity alert sent: {symbol} {verdict}")
                         last_alert_type[symbol] = direction
                     else:
