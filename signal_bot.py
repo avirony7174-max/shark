@@ -5,7 +5,7 @@ import time
 import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -263,6 +263,57 @@ def format_month_stats():
         f"Wins (TP): <code>{len(wins)}</code>   Losses (SL): <code>{len(losses)}</code>\n"
         f"Win rate (closed): <code>{win_rate:.1f}%</code>"
     )
+
+
+def fetch_recent_sweeps(hours=6):
+    """DUMP & PUMP (support sweep-and-reclaim) signals logged in the last N hours."""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/signal_log",
+                          headers=supabase_headers(),
+                          params={"timeframe": "eq.DUMP_PUMP", "created_at": f"gte.{since}",
+                                  "select": "*", "order": "created_at.desc"}, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"Supabase sweep fetch error: {e}")
+    return []
+
+
+def format_sweep_and_flow(hours=6):
+    """SWEEP command: recent liquidity sweeps (dump & pump) + live smart-money
+    (top-trader positioning) and taker order-flow direction for every coin."""
+    import analysis_v2  # lazy: analysis_v2 imports this module (circular)
+
+    sweeps = fetch_recent_sweeps(hours)
+    lines = [f"🔄 <b>Liquidity Sweep & Smart Money Flow</b> (last {hours}H)", "━━━━━━━━━━━━━━━"]
+
+    if sweeps:
+        lines.append(f"<b>Sweeps detected:</b> <code>{len(sweeps)}</code>")
+        for s in sweeps:
+            ts = (s.get("created_at") or "")[:16].replace("T", " ")
+            coin = s["symbol"].replace("USDT", "")
+            lines.append(
+                f"• <b>{coin}</b> {s['signal_type']} — entry <code>{s['entry']}</code> "
+                f"SL <code>{s['sl']}</code> TP <code>{s['tp']}</code> ({ts} UTC)"
+            )
+    else:
+        lines.append(f"No support sweep-and-reclaim signals in the last {hours}H.")
+
+    lines.append("")
+    lines.append("<b>Smart Money Flow (live):</b>")
+    for symbol in COINS:
+        coin = symbol.replace("USDT", "")
+        try:
+            data = analysis_v2.analyze(symbol, DEFAULT_TF_LABEL, TIMEFRAME_ALIASES[DEFAULT_TF_LABEL])
+            flow = analysis_v2.whale_flow_label(data["tt_long"], data["buy_pct"])
+            takers = analysis_v2.taker_label(data["buy_pct"])
+            lines.append(f"• <b>{coin}</b>: whales {flow} · takers {takers}")
+        except Exception as e:
+            print(f"format_sweep_and_flow {coin} error: {e}")
+            lines.append(f"• <b>{coin}</b>: flow data unavailable")
+
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -791,6 +842,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(format_month_stats(), parse_mode="HTML")
         return
 
+    if (text or "").strip().upper() in ("SWEEP", "FLOW"):
+        await update.message.reply_text("⏳ Checking sweeps and smart money flow...")
+        try:
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, format_sweep_and_flow)
+            await update.message.reply_text(msg, parse_mode="HTML")
+        except Exception as e:
+            print(f"handle_message sweep error: {e}")
+            await update.message.reply_text("❌ Error checking sweep/flow. Try again.")
+        return
+
     trade_cmd = parse_trade_command(text)
     if trade_cmd:
         tf_label, tf_binance = trade_cmd
@@ -821,7 +883,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "e.g. <code>BTC</code>, <code>BTC 1H</code>, <code>ETH 4H</code>, <code>SOL 15M</code>\n"
             "Timeframes: 15M · 30M · 1H · 4H · 1D (default 1H)\n\n"
             "Or send <b>TRADE</b> to compare all coins and see which has the best setup right now.\n"
-            "<b>STATS</b> — all-time signal win rate. <b>MONTH</b> — this month's signal count.",
+            "<b>STATS</b> — all-time signal win rate. <b>MONTH</b> — this month's signal count.\n"
+            "<b>SWEEP</b> — liquidity sweeps in the last 6H + live smart money (whale/taker) flow.",
             parse_mode="HTML"
         )
 
