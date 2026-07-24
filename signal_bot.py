@@ -39,7 +39,22 @@ VALID_COINS = {
 # so one alias map covers both candle fetching and OI-change lookups.
 TIMEFRAME_ALIASES = {"15M": "15m", "30M": "30m", "1H": "1h", "4H": "4h", "1D": "1d"}
 DEFAULT_TF_LABEL  = "1H"
-AUTO_SIGNAL_TF    = "1d"   # auto signal loop stays on Daily (kept configurable here)
+AUTO_SIGNAL_TF    = "1d"   # kept for backward compat / reference, not used directly anymore
+
+# auto_signal_loop now scans ALL of these timeframes per coin (not Daily-only),
+# so a valid EMA-pullback setup on ANY timeframe fires an alert. Label shown
+# in the alert message and used as the dedupe key (per coin+timeframe).
+AUTO_SIGNAL_TFS = [
+    ("15M", "15m"),
+    ("30M", "30m"),
+    ("1H",  "1h"),
+    ("4H",  "4h"),
+    ("1D",  "1d"),
+]
+
+# Reward:Risk multiplier used for TP distance (SL distance x this = TP distance).
+# 3.0 = 1:3 RR, 2.0 = 1:2 RR. check_signal() reads this at call time.
+RR_MULTIPLIER = 3.0
 
 EMA_FAST       = 21
 EMA_SLOW       = 50
@@ -627,7 +642,7 @@ def momentum_label(ef, es, rsi):
 # Signal engine — LONG and SHORT
 # ============================================================================
 
-def check_signal(candles):
+def check_signal(candles, rr_mult=RR_MULTIPLIER):
     """
     Returns {"type": "LONG"|"SHORT", "entry":.., "sl":.., "tp":..} or None.
     LONG and SHORT use mirrored logic:
@@ -635,6 +650,7 @@ def check_signal(candles):
              candle closing near its high, confirmed by volume + body size.
       SHORT: bearish EMA trend, pullback INTO EMA resistance, bearish rejection
              candle closing near its low, confirmed by volume + body size.
+    rr_mult controls TP distance as a multiple of SL distance (3.0 = 1:3, 2.0 = 1:2).
     """
     if len(candles) < EMA_SLOW + 5:
         return None
@@ -682,12 +698,12 @@ def check_signal(candles):
 
     if long_cond:
         sl = c_close - atr * 1.5
-        tp = c_close + (c_close - sl) * 3.0
+        tp = c_close + (c_close - sl) * rr_mult
         return {"type": "LONG", "entry": round(c_close, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
 
     if short_cond:
         sl = c_close + atr * 1.5
-        tp = c_close - (sl - c_close) * 3.0
+        tp = c_close - (sl - c_close) * rr_mult
         return {"type": "SHORT", "entry": round(c_close, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
 
     return None
@@ -890,51 +906,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def auto_signal_loop():
-    """Background loop on AUTO_SIGNAL_TF (Daily by default). Fires both
-    LONG and SHORT alerts, and re-arms whenever the signal direction flips
-    or clears: last_sig_type is the sole gate, so a direct LONG<->SHORT
-    reversal alerts immediately instead of waiting for a no-signal cycle."""
-    last_sig_type = {coin: None for coin in COINS}
+    """Background loop scanning EVERY timeframe in AUTO_SIGNAL_TFS (15M/30M/1H/4H/1D)
+    for every coin, each cycle. Fires both LONG and SHORT alerts. Dedupe key is now
+    (symbol, timeframe) so a signal on one timeframe doesn't block/get blocked by a
+    signal on another timeframe for the same coin — each timeframe re-arms independently
+    whenever its own signal direction flips or clears."""
+    last_sig_type = {(coin, tf_label): None for coin in COINS for tf_label, _ in AUTO_SIGNAL_TFS}
 
     def loop():
         while True:
             now = datetime.now(timezone.utc)
-            print(f"[{now.strftime('%H:%M UTC')}] Auto signal check...")
+            print(f"[{now.strftime('%H:%M UTC')}] Auto signal check (all timeframes)...")
             for symbol in COINS:
-                try:
-                    candles = fetch_candles(symbol, AUTO_SIGNAL_TF, limit=CANDLE_LIMIT)
-                    if not candles:
-                        continue
-                    sig = check_signal(candles)
-                    if sig:
-                        if last_sig_type[symbol] != sig["type"]:
-                            oi      = fetch_oi(symbol)
-                            funding = fetch_funding(symbol)
-                            coin    = symbol.replace("USDT", "")
-                            f_sign  = "+" if funding is not None and funding >= 0 else ""
-                            f_pay   = "Longs pay" if funding is not None and funding >= 0 else "Shorts pay"
-                            emoji   = "🟢" if sig["type"] == "LONG" else "🔴"
-                            msg = (
-                                f"{emoji} <b>{sig['type']} SIGNAL</b>\n"
-                                f"<b>{coin}/USDT</b> · Daily\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"Entry:  <code>{sig['entry']}</code>\n"
-                                f"SL:       <code>{sig['sl']}</code>\n"
-                                f"TP:       <code>{sig['tp']}</code>\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"OI:        <code>{oi}B</code>\n"
-                                f"Funding: <code>{f_sign}{funding}%</code>  ({f_pay})\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"<i>EMA Swing 21/50 · RR 1:3</i>"
-                            )
-                            notify(f"{coin} {sig['type']} Signal", msg)
-                            log_signal(symbol, sig["type"], sig["entry"], sig["sl"], sig["tp"], "DAILY")
-                            print(f"Signal sent: {symbol} {sig['type']}")
-                            last_sig_type[symbol] = sig["type"]
-                    else:
-                        last_sig_type[symbol] = None
-                except Exception as e:
-                    print(f"Error {symbol}: {e}")
+                for tf_label, tf_binance in AUTO_SIGNAL_TFS:
+                    try:
+                        candles = fetch_candles(symbol, tf_binance, limit=CANDLE_LIMIT)
+                        if not candles:
+                            continue
+                        sig = check_signal(candles, rr_mult=RR_MULTIPLIER)
+                        key = (symbol, tf_label)
+                        if sig:
+                            if last_sig_type[key] != sig["type"]:
+                                oi      = fetch_oi(symbol)
+                                funding = fetch_funding(symbol)
+                                coin    = symbol.replace("USDT", "")
+                                f_sign  = "+" if funding is not None and funding >= 0 else ""
+                                f_pay   = "Longs pay" if funding is not None and funding >= 0 else "Shorts pay"
+                                emoji   = "🟢" if sig["type"] == "LONG" else "🔴"
+                                rr_label = f"1:{RR_MULTIPLIER:g}"
+                                msg = (
+                                    f"{emoji} <b>{sig['type']} SIGNAL</b>\n"
+                                    f"<b>{coin}/USDT</b> · {tf_label}\n"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"Entry:  <code>{sig['entry']}</code>\n"
+                                    f"SL:       <code>{sig['sl']}</code>\n"
+                                    f"TP:       <code>{sig['tp']}</code>\n"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"OI:        <code>{oi}B</code>\n"
+                                    f"Funding: <code>{f_sign}{funding}%</code>  ({f_pay})\n"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"<i>EMA Swing 21/50 · RR {rr_label} · {tf_label}</i>"
+                                )
+                                notify(f"{coin} {sig['type']} Signal ({tf_label})", msg)
+                                log_signal(symbol, sig["type"], sig["entry"], sig["sl"], sig["tp"], tf_label)
+                                print(f"Signal sent: {symbol} {sig['type']} [{tf_label}]")
+                                last_sig_type[key] = sig["type"]
+                        else:
+                            last_sig_type[key] = None
+                    except Exception as e:
+                        print(f"Error {symbol} [{tf_label}]: {e}")
             time.sleep(CHECK_INTERVAL)
 
     t = threading.Thread(target=loop, daemon=True)
@@ -1153,7 +1173,7 @@ def main():
     print("Signal Bot starting...")
     notify(
         "Signal Bot started",
-        "✅ <b>Signal Bot চালু হয়েছে</b>\n"
+        "✅ <b>Signal Bot Started</b>\n"
         "BTC · ETH · SOL · LINK monitoring\n\n"
         "যেকোনো সময় লিখো:\n"
         "<b>BTC</b> বা <b>ETH</b> বা <b>SOL</b> বা <b>LINK</b>\n"
